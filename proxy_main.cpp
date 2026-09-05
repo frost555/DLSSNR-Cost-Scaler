@@ -1,5 +1,6 @@
 #include <mutex>
 #include <vector>
+#include <unordered_map>
 #include "forwarders.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -40,6 +41,12 @@ static void Log(const char* fmt, ...) {
         if (lastSlash) *(lastSlash + 1) = L'\0';
         wcscat_s(modulePath, L"nvngx_dlssnr_proxy.log");
         g_logFile = _wfsopen(modulePath, L"w", _SH_DENYNO);
+        if (!g_logFile) {
+            wchar_t tempPath[MAX_PATH] = { 0 };
+            GetTempPathW(MAX_PATH, tempPath);
+            wcscat_s(tempPath, L"nvngx_dlssnr_proxy.log");
+            g_logFile = _wfsopen(tempPath, L"w", _SH_DENYNO);
+        }
     }
     if (g_logFile) {
         va_list args;
@@ -268,14 +275,18 @@ static DXGI_FORMAT ToNonTypeless(DXGI_FORMAT format) {
     }
 }
 
-static DXGI_FORMAT GetUavSafeScratchFormat(DXGI_FORMAT format) {
+static DXGI_FORMAT ToUavCompatibleFormat(DXGI_FORMAT format) {
     format = ToNonTypeless(format);
     switch (format) {
-    case DXGI_FORMAT_R11G11B10_FLOAT:
-        return DXGI_FORMAT_R16G16B16A16_FLOAT;
-    default:
-        return format;
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    // R11G11B10_FLOAT natively supports typed UAV writes in D3D12
+    default: return format;
     }
+}
+
+static DXGI_FORMAT GetUavSafeScratchFormat(DXGI_FORMAT format) {
+    return ToUavCompatibleFormat(format);
 }
 
 struct DownsampleConstants {
@@ -303,20 +314,33 @@ static ID3D12PipelineState*      g_psoDownsample = nullptr;
 static ID3D12PipelineState*      g_psoResolve = nullptr;
 static ID3D12DescriptorHeap*     g_descHeap = nullptr;
 
-static ID3D12Resource*           g_colorSmall = nullptr;
-static ID3D12Resource*           g_outputSmall = nullptr;
-static D3D12_RESOURCE_STATES     g_colorSmallState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-static D3D12_RESOURCE_STATES     g_outputSmallState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+// Multi-Slot Feature Cache to support concurrent viewports and hooks (e.g. MSFS 2024 Upscaled + Present)
+struct FeatureSlot {
+    bool                inUse = false;
+    const void*         origGameHandle = nullptr;
+    void*               activeFeature = nullptr;
+    uint32_t            nativeW = 0;
+    uint32_t            nativeH = 0;
+    uint32_t            workW = 0;
+    uint32_t            workH = 0;
+    DXGI_FORMAT         colorFormat = DXGI_FORMAT_UNKNOWN;
+    DXGI_FORMAT         scratchFormat = DXGI_FORMAT_UNKNOWN;
+    float               scale = 1.0f;
 
-static uint32_t                  g_currentNativeWidth = 0;
-static uint32_t                  g_currentNativeHeight = 0;
-static uint32_t                  g_currentWorkWidth = 0;
-static uint32_t                  g_currentWorkHeight = 0;
-static float                     g_activeScale = 1.0f;
-static DXGI_FORMAT               g_activeFormat = DXGI_FORMAT_UNKNOWN;
+    ID3D12Resource*     colorSmall = nullptr;
+    ID3D12Resource*     outputSmall = nullptr;
+    ID3D12Resource*     nativeScratch = nullptr;
+    D3D12_RESOURCE_STATES colorSmallState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    D3D12_RESOURCE_STATES outputSmallState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    D3D12_RESOURCE_STATES nativeScratchState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 
-static std::mutex g_proxyMutex;
-static void* g_activeFeature = nullptr;
+    ULONGLONG           lastUsedTick = 0;
+};
+
+static constexpr size_t MAX_FEATURE_SLOTS = 4;
+static FeatureSlot g_slots[MAX_FEATURE_SLOTS] = {};
+
+static std::recursive_mutex g_proxyMutex;
 
 struct NrRetired {
     void* feature = nullptr;
@@ -333,21 +357,25 @@ static void ParkNrFeature(void*& feature) {
     g_retiredList.push_back(r);
 }
 
-static void ParkScratch() {
-    if (g_colorSmall) {
-        NrRetired r;
-        r.resource = g_colorSmall;
-        g_retiredList.push_back(r);
-        g_colorSmall = nullptr;
+static void ReleaseSlotResources(FeatureSlot& slot) {
+    if (slot.activeFeature) {
+        ParkNrFeature(slot.activeFeature);
     }
-    if (g_outputSmall) {
-        NrRetired r;
-        r.resource = g_outputSmall;
-        g_retiredList.push_back(r);
-        g_outputSmall = nullptr;
+    if (slot.colorSmall) {
+        NrRetired r; r.resource = slot.colorSmall; g_retiredList.push_back(r);
+        slot.colorSmall = nullptr;
     }
-    g_colorSmallState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    g_outputSmallState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    if (slot.outputSmall) {
+        NrRetired r; r.resource = slot.outputSmall; g_retiredList.push_back(r);
+        slot.outputSmall = nullptr;
+    }
+    if (slot.nativeScratch) {
+        NrRetired r; r.resource = slot.nativeScratch; g_retiredList.push_back(r);
+        slot.nativeScratch = nullptr;
+    }
+    slot.colorSmallState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    slot.outputSmallState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    slot.nativeScratchState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 }
 
 static void TickRetired() {
@@ -377,7 +405,25 @@ static void TransitionBarrier(ID3D12GraphicsCommandList* cmd, ID3D12Resource* re
     cmd->ResourceBarrier(1, &b);
 }
 
+static void ReleaseD3D12Pipeline() {
+    if (g_psoDownsample) { g_psoDownsample->Release(); g_psoDownsample = nullptr; }
+    if (g_psoResolve) { g_psoResolve->Release(); g_psoResolve = nullptr; }
+    if (g_rootSigDownsample) { g_rootSigDownsample->Release(); g_rootSigDownsample = nullptr; }
+    if (g_rootSigResolve) { g_rootSigResolve->Release(); g_rootSigResolve = nullptr; }
+    if (g_descHeap) { g_descHeap->Release(); g_descHeap = nullptr; }
+    g_device = nullptr;
+}
+
 static bool InitD3D12Pipeline(ID3D12Device* device) {
+    if (!device) return false;
+    if (g_device != nullptr && g_device != device) {
+        Log("[Proxy] D3D12 device changed (%p -> %p), resetting pipeline and slots", g_device, device);
+        ReleaseD3D12Pipeline();
+        for (size_t i = 0; i < MAX_FEATURE_SLOTS; ++i) {
+            ReleaseSlotResources(g_slots[i]);
+            g_slots[i].inUse = false;
+        }
+    }
     if (g_rootSigDownsample && g_rootSigResolve && g_psoDownsample && g_psoResolve && g_descHeap) return true;
     g_device = device;
 
@@ -496,7 +542,7 @@ static bool InitD3D12Pipeline(ID3D12Device* device) {
     }
 
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-    heapDesc.NumDescriptors = 128;
+    heapDesc.NumDescriptors = 512;
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 
@@ -504,7 +550,7 @@ static bool InitD3D12Pipeline(ID3D12Device* device) {
         return false;
     }
 
-    Log("[Proxy] D3D12 compute pipeline initialized");
+    Log("[Proxy] D3D12 compute pipeline initialized (512 descriptors)");
     return true;
 }
 
@@ -521,11 +567,16 @@ static ID3D12Resource* CreateScratchTexture(ID3D12Device* device, DXGI_FORMAT fo
     desc.Format = format;
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 
     ID3D12Resource* res = nullptr;
     HRESULT hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
                                                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&res));
+    if (FAILED(hr)) {
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&res));
+    }
     if (FAILED(hr)) {
         Log("[Proxy] Failed to allocate scratch texture %ux%u (hr=0x%08X)", width, height, hr);
         return nullptr;
@@ -542,7 +593,7 @@ __declspec(dllexport) int __cdecl NVSDK_NGX_D3D12_Init_Ext(
     int InVersion,
     const void* InFeatureInfo)
 {
-    std::lock_guard<std::mutex> lock(g_proxyMutex);
+    std::lock_guard<std::recursive_mutex> lock(g_proxyMutex);
     EnsureRealModuleLoaded();
     LoadConfig();
 
@@ -557,56 +608,29 @@ __declspec(dllexport) int __cdecl NVSDK_NGX_D3D12_CreateFeature(
     const void* InParameters,
     void** OutHandle)
 {
-    std::lock_guard<std::mutex> lock(g_proxyMutex);
+    std::lock_guard<std::recursive_mutex> lock(g_proxyMutex);
     EnsureRealModuleLoaded();
     CheckConfigHotReload();
 
     Log("[Proxy] NVSDK_NGX_D3D12_CreateFeature (FeatureId=%d)", InFeatureId);
 
     if (!real_Create) return -1;
-
-    NVSDK_NGX_Parameter* params = (NVSDK_NGX_Parameter*)InParameters;
-
-    uint32_t nativeWidth = 0;
-    uint32_t nativeHeight = 0;
-    if (params) {
-        params->Get("DLSSNR.Width", &nativeWidth);
-        params->Get("DLSSNR.Height", &nativeHeight);
-    }
-
-    g_currentNativeWidth = nativeWidth;
-    g_currentNativeHeight = nativeHeight;
-    g_currentWorkWidth = nativeWidth;
-    g_currentWorkHeight = nativeHeight;
-    g_activeScale = 1.0f;
-
-    if (g_activeFeature) {
-        ParkNrFeature(g_activeFeature);
-    }
-
-    int res = real_Create(InCmdList, InFeatureId, InParameters, OutHandle);
-    g_activeFeature = (OutHandle ? *OutHandle : nullptr);
-    Log("[Proxy] CreateFeature completed: res=0x%X, handle=%p (%ux%u)", res, g_activeFeature, nativeWidth, nativeHeight);
-    return res;
+    return real_Create(InCmdList, InFeatureId, InParameters, OutHandle);
 }
 
-__declspec(dllexport) int __cdecl NVSDK_NGX_D3D12_EvaluateFeature(
+static int EvaluateFeatureInternal(
     ID3D12GraphicsCommandList* InCmdList,
     const void* InFeatureHandle,
     const void* InParameters,
     void* InCallback)
 {
-    std::lock_guard<std::mutex> lock(g_proxyMutex);
-    if (!real_Evaluate) return -1;
-
     CheckConfigHotReload();
     CheckHotkeys();
     TickRetired();
 
     // Pass through directly to real DLL when proxy is disabled
     if (!g_enableProxy.load()) {
-        const void* feat = (g_activeFeature ? g_activeFeature : InFeatureHandle);
-        return real_Evaluate(InCmdList, feat, InParameters, InCallback);
+        return real_Evaluate(InCmdList, InFeatureHandle, InParameters, InCallback);
     }
 
     NVSDK_NGX_Parameter* params = (NVSDK_NGX_Parameter*)InParameters;
@@ -617,27 +641,33 @@ __declspec(dllexport) int __cdecl NVSDK_NGX_D3D12_EvaluateFeature(
     if (params) {
         params->Get("DLSSNR.Color", &origColor);
         params->Get("DLSSNR.Output", &origOutput);
+        if (!origColor) params->Get("Color", &origColor);
+        if (!origOutput) params->Get("Output", &origOutput);
     }
 
     if (!origColor || !origOutput || !InCmdList) {
-        const void* feat = (g_activeFeature ? g_activeFeature : InFeatureHandle);
-        return real_Evaluate(InCmdList, feat, InParameters, InCallback);
+        return real_Evaluate(InCmdList, InFeatureHandle, InParameters, InCallback);
     }
 
     D3D12_RESOURCE_DESC colorDesc = origColor->GetDesc();
     D3D12_RESOURCE_DESC outDesc = origOutput->GetDesc();
 
+    if (colorDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        outDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        colorDesc.Width == 0 || colorDesc.Height == 0)
+    {
+        return real_Evaluate(InCmdList, InFeatureHandle, InParameters, InCallback);
+    }
+
     ID3D12Device* device = nullptr;
     InCmdList->GetDevice(IID_PPV_ARGS(&device));
     if (!device) {
-        const void* feat = (g_activeFeature ? g_activeFeature : InFeatureHandle);
-        return real_Evaluate(InCmdList, feat, InParameters, InCallback);
+        return real_Evaluate(InCmdList, InFeatureHandle, InParameters, InCallback);
     }
 
     if (!InitD3D12Pipeline(device)) {
         device->Release();
-        const void* feat = (g_activeFeature ? g_activeFeature : InFeatureHandle);
-        return real_Evaluate(InCmdList, feat, InParameters, InCallback);
+        return real_Evaluate(InCmdList, InFeatureHandle, InParameters, InCallback);
     }
 
     uint32_t nativeW = (uint32_t)colorDesc.Width;
@@ -651,35 +681,133 @@ __declspec(dllexport) int __cdecl NVSDK_NGX_D3D12_EvaluateFeature(
     DXGI_FORMAT typedOutFormat = ToNonTypeless(outDesc.Format);
     DXGI_FORMAT scratchFormat = GetUavSafeScratchFormat(typedColorFormat);
 
-    bool scaleChanged = (fabsf(g_activeScale - currentScale) > 0.005f);
-    bool formatChanged = (g_activeFormat != typedColorFormat);
-    bool dimChanged = (g_currentNativeWidth != nativeW || g_currentNativeHeight != nativeH);
-
-    if (currentScale < 0.999f) {
-        if (!g_colorSmall || g_currentWorkWidth != workW || g_currentWorkHeight != workH || formatChanged || dimChanged) {
-            ParkScratch();
-            g_colorSmall = CreateScratchTexture(device, scratchFormat, workW, workH);
-            g_outputSmall = CreateScratchTexture(device, scratchFormat, workW, workH);
-            g_currentWorkWidth = workW;
-            g_currentWorkHeight = workH;
-            g_currentNativeWidth = nativeW;
-            g_currentNativeHeight = nativeH;
-            Log("[Proxy] Reallocated scratch textures: work=%ux%u, native=%ux%u (Format=%d, ScratchFormat=%d, Scale=%.2f)",
-                workW, workH, nativeW, nativeH, typedColorFormat, scratchFormat, currentScale);
+    // Multi-Slot Lookup: Find slot matching this game handle, resolution, and color format
+    FeatureSlot* slot = nullptr;
+    if (InFeatureHandle) {
+        for (size_t i = 0; i < MAX_FEATURE_SLOTS; ++i) {
+            if (g_slots[i].inUse &&
+                g_slots[i].origGameHandle == InFeatureHandle &&
+                g_slots[i].nativeW == nativeW &&
+                g_slots[i].nativeH == nativeH &&
+                g_slots[i].colorFormat == typedColorFormat)
+            {
+                slot = &g_slots[i];
+                break;
+            }
         }
-    } else {
-        if (g_colorSmall) {
-            ParkScratch();
+    }
+    if (!slot) {
+        for (size_t i = 0; i < MAX_FEATURE_SLOTS; ++i) {
+            if (g_slots[i].inUse &&
+                g_slots[i].nativeW == nativeW &&
+                g_slots[i].nativeH == nativeH &&
+                g_slots[i].colorFormat == typedColorFormat)
+            {
+                slot = &g_slots[i];
+                break;
+            }
         }
     }
 
-    if (scaleChanged || formatChanged || dimChanged || !g_activeFeature) {
-        if (g_activeFeature) {
-            ParkNrFeature(g_activeFeature);
+    // Allocate slot if not found
+    if (!slot) {
+        for (size_t i = 0; i < MAX_FEATURE_SLOTS; ++i) {
+            if (!g_slots[i].inUse) {
+                slot = &g_slots[i];
+                break;
+            }
+        }
+        if (!slot) {
+            size_t lruIdx = 0;
+            ULONGLONG oldest = g_slots[0].lastUsedTick;
+            for (size_t i = 1; i < MAX_FEATURE_SLOTS; ++i) {
+                if (g_slots[i].lastUsedTick < oldest) {
+                    oldest = g_slots[i].lastUsedTick;
+                    lruIdx = i;
+                }
+            }
+            slot = &g_slots[lruIdx];
+            ReleaseSlotResources(*slot);
+        }
+        slot->inUse = true;
+        slot->origGameHandle = InFeatureHandle;
+        slot->nativeW = nativeW;
+        slot->nativeH = nativeH;
+        slot->colorFormat = typedColorFormat;
+        slot->scratchFormat = scratchFormat;
+        slot->scale = currentScale;
+        slot->workW = workW;
+        slot->workH = workH;
+    }
+
+    slot->origGameHandle = InFeatureHandle;
+    slot->lastUsedTick = GetTickCount64();
+
+    bool scaleChanged = (fabsf(slot->scale - currentScale) > 0.005f);
+    bool formatChanged = (slot->colorFormat != typedColorFormat || slot->scratchFormat != scratchFormat);
+    bool sizeChanged = (slot->nativeW != nativeW || slot->nativeH != nativeH);
+    bool needRecreate = scaleChanged || formatChanged || sizeChanged || !slot->activeFeature;
+
+    slot->colorFormat = typedColorFormat;
+    slot->scratchFormat = scratchFormat;
+    slot->nativeW = nativeW;
+    slot->nativeH = nativeH;
+
+    if (currentScale < 0.999f) {
+        if (!slot->colorSmall || slot->workW != workW || slot->workH != workH) {
+            ReleaseSlotResources(*slot);
+            slot->colorSmall = CreateScratchTexture(device, scratchFormat, workW, workH);
+            slot->outputSmall = CreateScratchTexture(device, scratchFormat, workW, workH);
+            slot->nativeScratch = CreateScratchTexture(device, scratchFormat, nativeW, nativeH);
+            slot->workW = workW;
+            slot->workH = workH;
+            slot->scratchFormat = scratchFormat;
+            needRecreate = true;
+            Log("[Proxy] Allocated slot textures: work=%ux%u, native=%ux%u (Format=%d, ScratchFormat=%d, Scale=%.2f)",
+                workW, workH, nativeW, nativeH, typedColorFormat, scratchFormat, currentScale);
+        }
+    } else {
+        if (slot->colorSmall) {
+            ReleaseSlotResources(*slot);
+            needRecreate = true;
+        }
+    }
+
+    if (needRecreate) {
+        if (slot->activeFeature) {
+            ParkNrFeature(slot->activeFeature);
         }
 
+        uint32_t origWidth = 0, origHeight = 0, origOutW = 0, origOutH = 0;
+        uint32_t origInW = 0, origInH = 0;
+        uint32_t origDlssInW = 0, origDlssInH = 0, origDlssOutW = 0, origDlssOutH = 0;
+        ID3D12Resource* origColorParam = nullptr;
+        ID3D12Resource* origOutParam = nullptr;
+        params->Get("Width", &origWidth);
+        params->Get("Height", &origHeight);
+        params->Get("OutWidth", &origOutW);
+        params->Get("OutHeight", &origOutH);
+        params->Get("InputWidth", &origInW);
+        params->Get("InputHeight", &origInH);
+        params->Get("DLSSNR.InputWidth", &origDlssInW);
+        params->Get("DLSSNR.InputHeight", &origDlssInH);
+        params->Get("DLSSNR.OutputWidth", &origDlssOutW);
+        params->Get("DLSSNR.OutputHeight", &origDlssOutH);
+        params->Get("Color", &origColorParam);
+        params->Get("Output", &origOutParam);
+
+        params->Set("Width", workW);
+        params->Set("Height", workH);
+        params->Set("OutWidth", workW);
+        params->Set("OutHeight", workH);
+        params->Set("InputWidth", workW);
+        params->Set("InputHeight", workH);
         params->Set("DLSSNR.Width", workW);
         params->Set("DLSSNR.Height", workH);
+        params->Set("DLSSNR.InputWidth", workW);
+        params->Set("DLSSNR.InputHeight", workH);
+        params->Set("DLSSNR.OutputWidth", workW);
+        params->Set("DLSSNR.OutputHeight", workH);
         params->Set("DLSSNR.ColorSubrectBaseX", 0u);
         params->Set("DLSSNR.ColorSubrectBaseY", 0u);
         params->Set("DLSSNR.ColorSubrectWidth", workW);
@@ -690,73 +818,208 @@ __declspec(dllexport) int __cdecl NVSDK_NGX_D3D12_EvaluateFeature(
         params->Set("DLSSNR.OutputSubrectHeight", workH);
 
         if (currentScale < 0.999f) {
-            params->Set("DLSSNR.Color", g_colorSmall);
-            params->Set("DLSSNR.Output", g_outputSmall);
+            params->Set("Color", slot->colorSmall);
+            params->Set("Output", slot->outputSmall);
+            params->Set("DLSSNR.Color", slot->colorSmall);
+            params->Set("DLSSNR.Output", slot->outputSmall);
         } else {
+            params->Set("Color", origColor);
+            params->Set("Output", origOutput);
             params->Set("DLSSNR.Color", origColor);
             params->Set("DLSSNR.Output", origOutput);
         }
 
-        int createRes = real_Create(InCmdList, 18, params, &g_activeFeature);
-        Log("[Proxy] Recreated feature for scale %.2f (%ux%u -> native %ux%u): res=0x%X, handle=%p",
-            currentScale, workW, workH, nativeW, nativeH, createRes, g_activeFeature);
+        int createRes = real_Create(InCmdList, 18, params, &slot->activeFeature);
+        Log("[Proxy] Created neural feature in slot (%ux%u -> native %ux%u, scale=%.2f): res=0x%X, handle=%p",
+            workW, workH, nativeW, nativeH, currentScale, createRes, slot->activeFeature);
+
+        if (origWidth) params->Set("Width", origWidth);
+        if (origHeight) params->Set("Height", origHeight);
+        if (origOutW) params->Set("OutWidth", origOutW);
+        if (origOutH) params->Set("OutHeight", origOutH);
+        if (origInW) params->Set("InputWidth", origInW);
+        if (origInH) params->Set("InputHeight", origInH);
+        if (origDlssInW) params->Set("DLSSNR.InputWidth", origDlssInW);
+        if (origDlssInH) params->Set("DLSSNR.InputHeight", origDlssInH);
+        if (origDlssOutW) params->Set("DLSSNR.OutputWidth", origDlssOutW);
+        if (origDlssOutH) params->Set("DLSSNR.OutputHeight", origDlssOutH);
+        if (origColorParam) params->Set("Color", origColorParam);
+        if (origOutParam) params->Set("Output", origOutParam);
 
         params->Set("DLSSNR.Color", origColor);
         params->Set("DLSSNR.Output", origOutput);
         params->Set("DLSSNR.Width", nativeW);
         params->Set("DLSSNR.Height", nativeH);
+        params->Set("DLSSNR.ColorSubrectBaseX", 0u);
+        params->Set("DLSSNR.ColorSubrectBaseY", 0u);
+        params->Set("DLSSNR.ColorSubrectWidth", nativeW);
+        params->Set("DLSSNR.ColorSubrectHeight", nativeH);
+        params->Set("DLSSNR.OutputSubrectBaseX", 0u);
+        params->Set("DLSSNR.OutputSubrectBaseY", 0u);
+        params->Set("DLSSNR.OutputSubrectWidth", nativeW);
+        params->Set("DLSSNR.OutputSubrectHeight", nativeH);
 
-        g_activeScale = currentScale;
-        g_activeFormat = typedColorFormat;
-        g_currentNativeWidth = nativeW;
-        g_currentNativeHeight = nativeH;
+        if (NVSDK_NGX_FAILED(createRes) || !slot->activeFeature) {
+            Log("[Proxy] real_Create failed (0x%X), falling back to native passthrough", createRes);
+            slot->activeFeature = nullptr;
+            slot->scale = 1.0f;
+            device->Release();
+            return real_Evaluate(InCmdList, InFeatureHandle, InParameters, InCallback);
+        }
 
-        // Skip evaluation on creation frame to allow GPU to execute allocation barriers
-        device->Release();
-        return 0;
+        slot->scale = currentScale;
     }
 
     device->Release();
 
     if (currentScale >= 0.999f) {
-        const void* feat = (g_activeFeature ? g_activeFeature : InFeatureHandle);
+        const void* feat = (slot->activeFeature ? slot->activeFeature : InFeatureHandle);
         return real_Evaluate(InCmdList, feat, InParameters, InCallback);
     }
 
-    if (!g_colorSmall || !g_outputSmall || !g_activeFeature) {
-        const void* feat = (g_activeFeature ? g_activeFeature : InFeatureHandle);
+    if (!slot->colorSmall || !slot->outputSmall || !slot->activeFeature) {
+        const void* feat = (slot->activeFeature ? slot->activeFeature : InFeatureHandle);
         return real_Evaluate(InCmdList, feat, InParameters, InCallback);
     }
 
+    // Save original parameters
     float origMvX = 1.0f, origMvY = 1.0f;
     uint32_t origW = nativeW, origH = nativeH;
-    uint32_t origColorBaseX = 0, origColorBaseY = 0;
-    uint32_t origOutBaseX = 0, origOutBaseY = 0;
-    uint32_t origColorSubW = nativeW, origColorSubH = nativeH;
-    uint32_t origOutSubW = nativeW, origOutSubH = nativeH;
+    uint32_t origInW = 0, origInH = 0, origOutW = 0, origOutH = 0;
+    uint32_t origDlssInW = 0, origDlssInH = 0, origDlssOutW = 0, origDlssOutH = 0;
 
-    params->Get("DLSSNR.MVecScaleX", &origMvX);
-    params->Get("DLSSNR.MVecScaleY", &origMvY);
-    params->Get("DLSSNR.Width", &origW);
-    params->Get("DLSSNR.Height", &origH);
+    uint32_t origColorBaseX = 0, origColorBaseY = 0, origColorSubW = nativeW, origColorSubH = nativeH;
+    uint32_t origOutBaseX = 0, origOutBaseY = 0, origOutSubW = nativeW, origOutSubH = nativeH;
+    uint32_t origDepthBaseX = 0, origDepthBaseY = 0, origDepthSubW = 0, origDepthSubH = 0;
+    uint32_t origMvBaseX = 0, origMvBaseY = 0, origMvSubW = 0, origMvSubH = 0;
+
+    if (params->Get("DLSSNR.MVecScaleX", &origMvX) != 0) params->Get("MVecScaleX", &origMvX);
+    if (params->Get("DLSSNR.MVecScaleY", &origMvY) != 0) params->Get("MVecScaleY", &origMvY);
+    if (params->Get("DLSSNR.Width", &origW) != 0) params->Get("Width", &origW);
+    if (params->Get("DLSSNR.Height", &origH) != 0) params->Get("Height", &origH);
+
+    params->Get("InputWidth", &origInW);
+    params->Get("InputHeight", &origInH);
+    params->Get("OutWidth", &origOutW);
+    params->Get("OutHeight", &origOutH);
+    params->Get("DLSSNR.InputWidth", &origDlssInW);
+    params->Get("DLSSNR.InputHeight", &origDlssInH);
+    params->Get("DLSSNR.OutputWidth", &origDlssOutW);
+    params->Get("DLSSNR.OutputHeight", &origDlssOutH);
+
     params->Get("DLSSNR.ColorSubrectBaseX", &origColorBaseX);
     params->Get("DLSSNR.ColorSubrectBaseY", &origColorBaseY);
-    params->Get("DLSSNR.OutputSubrectBaseX", &origOutBaseX);
-    params->Get("DLSSNR.OutputSubrectBaseY", &origOutBaseY);
     params->Get("DLSSNR.ColorSubrectWidth", &origColorSubW);
     params->Get("DLSSNR.ColorSubrectHeight", &origColorSubH);
+
+    params->Get("DLSSNR.OutputSubrectBaseX", &origOutBaseX);
+    params->Get("DLSSNR.OutputSubrectBaseY", &origOutBaseY);
     params->Get("DLSSNR.OutputSubrectWidth", &origOutSubW);
     params->Get("DLSSNR.OutputSubrectHeight", &origOutSubH);
 
+    params->Get("DLSSNR.DepthSubrectBaseX", &origDepthBaseX);
+    params->Get("DLSSNR.DepthSubrectBaseY", &origDepthBaseY);
+    params->Get("DLSSNR.DepthSubrectWidth", &origDepthSubW);
+    params->Get("DLSSNR.DepthSubrectHeight", &origDepthSubH);
+
+    params->Get("DLSSNR.MVecSubrectBaseX", &origMvBaseX);
+    params->Get("DLSSNR.MVecSubrectBaseY", &origMvBaseY);
+    params->Get("DLSSNR.MVecSubrectWidth", &origMvSubW);
+    params->Get("DLSSNR.MVecSubrectHeight", &origMvSubH);
+
+    // Query G-buffers if present (e.g. RenoDX Upscaled hook)
+    ID3D12Resource* depthRes = nullptr;
+    if (params->Get("DLSSNR.Depth", &depthRes) != 0 || !depthRes) {
+        params->Get("Depth", &depthRes);
+    }
+
+    ID3D12Resource* mvecRes = nullptr;
+    if (params->Get("DLSSNR.MVec", &mvecRes) != 0 || !mvecRes) {
+        if (params->Get("MotionVectors", &mvecRes) != 0 || !mvecRes) {
+            params->Get("DLSSNR.MotionVectors", &mvecRes);
+        }
+    }
+
+    uint32_t actualDepthW = origDepthSubW, actualDepthH = origDepthSubH;
+    if (depthRes) {
+        D3D12_RESOURCE_DESC dDesc = depthRes->GetDesc();
+        actualDepthW = origDepthSubW ? origDepthSubW : (uint32_t)dDesc.Width;
+        actualDepthH = origDepthSubH ? origDepthSubH : dDesc.Height;
+    }
+
+    uint32_t actualMvW = origMvSubW, actualMvH = origMvSubH;
+    if (mvecRes) {
+        D3D12_RESOURCE_DESC mDesc = mvecRes->GetDesc();
+        actualMvW = origMvSubW ? origMvSubW : (uint32_t)mDesc.Width;
+        actualMvH = origMvSubH ? origMvSubH : mDesc.Height;
+    }
+
+    static bool s_loggedGbuffers = false;
+    if (!s_loggedGbuffers && (depthRes || mvecRes)) {
+        s_loggedGbuffers = true;
+        Log("[Proxy] G-buffers detected on evaluate: Depth=%p (%ux%u), MVec=%p (%ux%u)",
+            depthRes, actualDepthW, actualDepthH, mvecRes, actualMvW, actualMvH);
+    }
+
     float mvFactor = (float)workW / (float)nativeW;
 
+    auto RestoreParameters = [&]() {
+        params->Set("DLSSNR.Color", origColor);
+        params->Set("DLSSNR.Output", origOutput);
+        params->Set("Color", origColor);
+        params->Set("Output", origOutput);
+
+        params->Set("DLSSNR.Width", origW);
+        params->Set("DLSSNR.Height", origH);
+        params->Set("Width", origW);
+        params->Set("Height", origH);
+
+        if (origInW) params->Set("InputWidth", origInW);
+        if (origInH) params->Set("InputHeight", origInH);
+        if (origOutW) params->Set("OutWidth", origOutW);
+        if (origOutH) params->Set("OutHeight", origOutH);
+        if (origDlssInW) params->Set("DLSSNR.InputWidth", origDlssInW);
+        if (origDlssInH) params->Set("DLSSNR.InputHeight", origDlssInH);
+        if (origDlssOutW) params->Set("DLSSNR.OutputWidth", origDlssOutW);
+        if (origDlssOutH) params->Set("DLSSNR.OutputHeight", origDlssOutH);
+
+        params->Set("DLSSNR.ColorSubrectBaseX", origColorBaseX);
+        params->Set("DLSSNR.ColorSubrectBaseY", origColorBaseY);
+        params->Set("DLSSNR.ColorSubrectWidth", origColorSubW);
+        params->Set("DLSSNR.ColorSubrectHeight", origColorSubH);
+
+        params->Set("DLSSNR.OutputSubrectBaseX", origOutBaseX);
+        params->Set("DLSSNR.OutputSubrectBaseY", origOutBaseY);
+        params->Set("DLSSNR.OutputSubrectWidth", origOutSubW);
+        params->Set("DLSSNR.OutputSubrectHeight", origOutSubH);
+
+        if (depthRes) {
+            params->Set("DLSSNR.DepthSubrectBaseX", origDepthBaseX);
+            params->Set("DLSSNR.DepthSubrectBaseY", origDepthBaseY);
+            params->Set("DLSSNR.DepthSubrectWidth", origDepthSubW);
+            params->Set("DLSSNR.DepthSubrectHeight", origDepthSubH);
+        }
+
+        if (mvecRes) {
+            params->Set("DLSSNR.MVecSubrectBaseX", origMvBaseX);
+            params->Set("DLSSNR.MVecSubrectBaseY", origMvBaseY);
+            params->Set("DLSSNR.MVecSubrectWidth", origMvSubW);
+            params->Set("DLSSNR.MVecSubrectHeight", origMvSubH);
+        }
+
+        params->Set("DLSSNR.MVecScaleX", origMvX);
+        params->Set("DLSSNR.MVecScaleY", origMvY);
+        params->Set("MVecScaleX", origMvX);
+        params->Set("MVecScaleY", origMvY);
+    };
+
     // Pass 1: Downsample native color to scratch input
-    TransitionBarrier(InCmdList, g_colorSmall, g_colorSmallState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    g_colorSmallState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    TransitionBarrier(InCmdList, slot->colorSmall, slot->colorSmallState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    slot->colorSmallState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 
     UINT descSize = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     static uint32_t s_frameSlot = 0;
-    s_frameSlot = (s_frameSlot + 1) % 16;
+    s_frameSlot = (s_frameSlot + 1) % 64;
     uint32_t baseSlot = s_frameSlot * 8;
 
     D3D12_CPU_DESCRIPTOR_HANDLE heapCpuStart = g_descHeap->GetCPUDescriptorHandleForHeapStart();
@@ -776,7 +1039,7 @@ __declspec(dllexport) int __cdecl NVSDK_NGX_D3D12_EvaluateFeature(
     D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
     uavDesc.Format = scratchFormat;
     uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    g_device->CreateUnorderedAccessView(g_colorSmall, nullptr, &uavDesc, cpuHandle1);
+    g_device->CreateUnorderedAccessView(slot->colorSmall, nullptr, &uavDesc, cpuHandle1);
 
     InCmdList->SetComputeRootSignature(g_rootSigDownsample);
     ID3D12DescriptorHeap* heaps[] = { g_descHeap };
@@ -788,32 +1051,100 @@ __declspec(dllexport) int __cdecl NVSDK_NGX_D3D12_EvaluateFeature(
     InCmdList->SetPipelineState(g_psoDownsample);
     InCmdList->Dispatch((workW + 7) / 8, (workH + 7) / 8, 1);
 
-    TransitionBarrier(InCmdList, g_colorSmall, g_colorSmallState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    g_colorSmallState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    TransitionBarrier(InCmdList, slot->colorSmall, slot->colorSmallState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    slot->colorSmallState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
-    TransitionBarrier(InCmdList, g_outputSmall, g_outputSmallState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    g_outputSmallState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    TransitionBarrier(InCmdList, slot->outputSmall, slot->outputSmallState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    slot->outputSmallState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 
-    params->Set("DLSSNR.Color", g_colorSmall);
-    params->Set("DLSSNR.Output", g_outputSmall);
+    params->Set("DLSSNR.Color", slot->colorSmall);
+    params->Set("DLSSNR.Output", slot->outputSmall);
+    params->Set("Color", slot->colorSmall);
+    params->Set("Output", slot->outputSmall);
+
     params->Set("DLSSNR.Width", workW);
     params->Set("DLSSNR.Height", workH);
+    params->Set("Width", workW);
+    params->Set("Height", workH);
+    params->Set("InputWidth", workW);
+    params->Set("InputHeight", workH);
+    params->Set("OutWidth", workW);
+    params->Set("OutHeight", workH);
+    params->Set("DLSSNR.InputWidth", workW);
+    params->Set("DLSSNR.InputHeight", workH);
+    params->Set("DLSSNR.OutputWidth", workW);
+    params->Set("DLSSNR.OutputHeight", workH);
+
     params->Set("DLSSNR.ColorSubrectBaseX", 0u);
     params->Set("DLSSNR.ColorSubrectBaseY", 0u);
     params->Set("DLSSNR.ColorSubrectWidth", workW);
     params->Set("DLSSNR.ColorSubrectHeight", workH);
+
     params->Set("DLSSNR.OutputSubrectBaseX", 0u);
     params->Set("DLSSNR.OutputSubrectBaseY", 0u);
     params->Set("DLSSNR.OutputSubrectWidth", workW);
     params->Set("DLSSNR.OutputSubrectHeight", workH);
+
+    if (depthRes && actualDepthW > 0 && actualDepthH > 0) {
+        params->Set("DLSSNR.DepthSubrectBaseX", origDepthBaseX);
+        params->Set("DLSSNR.DepthSubrectBaseY", origDepthBaseY);
+        params->Set("DLSSNR.DepthSubrectWidth", actualDepthW);
+        params->Set("DLSSNR.DepthSubrectHeight", actualDepthH);
+    }
+
+    if (mvecRes && actualMvW > 0 && actualMvH > 0) {
+        params->Set("DLSSNR.MVecSubrectBaseX", origMvBaseX);
+        params->Set("DLSSNR.MVecSubrectBaseY", origMvBaseY);
+        params->Set("DLSSNR.MVecSubrectWidth", actualMvW);
+        params->Set("DLSSNR.MVecSubrectHeight", actualMvH);
+    }
+
     params->Set("DLSSNR.MVecScaleX", origMvX * mvFactor);
     params->Set("DLSSNR.MVecScaleY", origMvY * mvFactor);
+    params->Set("MVecScaleX", origMvX * mvFactor);
+    params->Set("MVecScaleY", origMvY * mvFactor);
 
-    int result = real_Evaluate(InCmdList, g_activeFeature, InParameters, InCallback);
+    int result = real_Evaluate(InCmdList, slot->activeFeature, InParameters, InCallback);
+
+    // If neural evaluate failed, skip resolve pass to avoid corrupting output
+    if (NVSDK_NGX_FAILED(result)) {
+        Log("[Proxy] real_Evaluate failed (0x%X), skipping resolve pass", result);
+        RestoreParameters();
+        return result;
+    }
 
     // Pass 2: High-frequency residual resolve and composite
-    TransitionBarrier(InCmdList, g_outputSmall, g_outputSmallState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    g_outputSmallState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    TransitionBarrier(InCmdList, slot->outputSmall, slot->outputSmallState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    slot->outputSmallState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+    bool inPlace = (origColor == origOutput);
+    bool outHasUav = (outDesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
+
+    ID3D12Resource* resolveReadSource = origColor;
+    ID3D12Resource* resolveWriteDest = origOutput;
+    DXGI_FORMAT resolveReadFormat = typedColorFormat;
+    DXGI_FORMAT resolveWriteFormat = ToUavCompatibleFormat(typedOutFormat);
+
+    if (inPlace && slot->nativeScratch && colorDesc.Format == slot->nativeScratch->GetDesc().Format) {
+        TransitionBarrier(InCmdList, origColor, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        TransitionBarrier(InCmdList, slot->nativeScratch, slot->nativeScratchState, D3D12_RESOURCE_STATE_COPY_DEST);
+        slot->nativeScratchState = D3D12_RESOURCE_STATE_COPY_DEST;
+        InCmdList->CopyResource(slot->nativeScratch, origColor);
+
+        TransitionBarrier(InCmdList, slot->nativeScratch, slot->nativeScratchState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        slot->nativeScratchState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        TransitionBarrier(InCmdList, origColor, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+        resolveReadSource = slot->nativeScratch;
+        resolveReadFormat = scratchFormat;
+    }
+    else if (!outHasUav && slot->nativeScratch) {
+        TransitionBarrier(InCmdList, slot->nativeScratch, slot->nativeScratchState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        slot->nativeScratchState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+
+        resolveWriteDest = slot->nativeScratch;
+        resolveWriteFormat = scratchFormat;
+    }
 
     D3D12_CPU_DESCRIPTOR_HANDLE cpuRes0 = { heapCpuStart.ptr + (baseSlot + 2) * descSize };
     D3D12_CPU_DESCRIPTOR_HANDLE cpuRes1 = { heapCpuStart.ptr + (baseSlot + 3) * descSize };
@@ -822,14 +1153,14 @@ __declspec(dllexport) int __cdecl NVSDK_NGX_D3D12_EvaluateFeature(
     D3D12_GPU_DESCRIPTOR_HANDLE gpuHandleResolve = { heapGpuStart.ptr + (baseSlot + 2) * descSize };
 
     srvDesc.Format = scratchFormat;
-    g_device->CreateShaderResourceView(g_colorSmall, &srvDesc, cpuRes0);
-    g_device->CreateShaderResourceView(g_outputSmall, &srvDesc, cpuRes1);
+    g_device->CreateShaderResourceView(slot->colorSmall, &srvDesc, cpuRes0);
+    g_device->CreateShaderResourceView(slot->outputSmall, &srvDesc, cpuRes1);
 
-    srvDesc.Format = typedColorFormat;
-    g_device->CreateShaderResourceView(origColor, &srvDesc, cpuRes2);
+    srvDesc.Format = resolveReadFormat;
+    g_device->CreateShaderResourceView(resolveReadSource, &srvDesc, cpuRes2);
 
-    uavDesc.Format = typedOutFormat;
-    g_device->CreateUnorderedAccessView(origOutput, nullptr, &uavDesc, cpuRes3);
+    uavDesc.Format = resolveWriteFormat;
+    g_device->CreateUnorderedAccessView(resolveWriteDest, nullptr, &uavDesc, cpuRes3);
 
     InCmdList->SetComputeRootSignature(g_rootSigResolve);
     InCmdList->SetDescriptorHeaps(1, heaps);
@@ -851,46 +1182,71 @@ __declspec(dllexport) int __cdecl NVSDK_NGX_D3D12_EvaluateFeature(
 
     D3D12_RESOURCE_BARRIER uavFlush = {};
     uavFlush.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-    uavFlush.UAV.pResource = origOutput;
+    uavFlush.UAV.pResource = resolveWriteDest;
     InCmdList->ResourceBarrier(1, &uavFlush);
 
-    params->Set("DLSSNR.Color", origColor);
-    params->Set("DLSSNR.Output", origOutput);
-    params->Set("DLSSNR.Width", nativeW);
-    params->Set("DLSSNR.Height", nativeH);
-    params->Set("DLSSNR.ColorSubrectBaseX", origColorBaseX);
-    params->Set("DLSSNR.ColorSubrectBaseY", origColorBaseY);
-    params->Set("DLSSNR.ColorSubrectWidth", origColorSubW);
-    params->Set("DLSSNR.ColorSubrectHeight", origColorSubH);
-    params->Set("DLSSNR.OutputSubrectBaseX", origOutBaseX);
-    params->Set("DLSSNR.OutputSubrectBaseY", origOutBaseY);
-    params->Set("DLSSNR.OutputSubrectWidth", origOutSubW);
-    params->Set("DLSSNR.OutputSubrectHeight", origOutSubH);
-    params->Set("DLSSNR.MVecScaleX", origMvX);
-    params->Set("DLSSNR.MVecScaleY", origMvY);
+    if (!outHasUav && slot->nativeScratch && resolveWriteDest == slot->nativeScratch && outDesc.Format == slot->nativeScratch->GetDesc().Format) {
+        TransitionBarrier(InCmdList, slot->nativeScratch, slot->nativeScratchState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        slot->nativeScratchState = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        TransitionBarrier(InCmdList, origOutput, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+        InCmdList->CopyResource(origOutput, slot->nativeScratch);
+        TransitionBarrier(InCmdList, origOutput, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
 
+    RestoreParameters();
+
+    return result;
+}
+
+__declspec(dllexport) int __cdecl NVSDK_NGX_D3D12_EvaluateFeature(
+    ID3D12GraphicsCommandList* InCmdList,
+    const void* InFeatureHandle,
+    const void* InParameters,
+    void* InCallback)
+{
+    g_proxyMutex.lock();
+    if (!real_Evaluate) {
+        g_proxyMutex.unlock();
+        return -1;
+    }
+
+    int result = -1;
+    __try {
+        result = EvaluateFeatureInternal(InCmdList, InFeatureHandle, InParameters, InCallback);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("[Proxy] CRITICAL: SEH Exception 0x%08X caught in EvaluateFeature! Falling back to native passthrough.", GetExceptionCode());
+        if (real_Evaluate) {
+            result = real_Evaluate(InCmdList, InFeatureHandle, InParameters, InCallback);
+        }
+    }
+    g_proxyMutex.unlock();
     return result;
 }
 
 __declspec(dllexport) void __cdecl NVSDK_NGX_D3D12_ReleaseFeature(void* InFeatureHandle)
 {
-    std::lock_guard<std::mutex> lock(g_proxyMutex);
+    std::lock_guard<std::recursive_mutex> lock(g_proxyMutex);
     EnsureRealModuleLoaded();
     Log("[Proxy] NVSDK_NGX_D3D12_ReleaseFeature (Handle=%p)", InFeatureHandle);
 
-    ParkScratch();
-
-    if (g_activeFeature) {
-        ParkNrFeature(g_activeFeature);
+    bool alreadyParked = false;
+    for (size_t i = 0; i < MAX_FEATURE_SLOTS; ++i) {
+        if (g_slots[i].inUse && (g_slots[i].origGameHandle == InFeatureHandle || g_slots[i].activeFeature == InFeatureHandle)) {
+            if (g_slots[i].activeFeature == InFeatureHandle) {
+                alreadyParked = true;
+            }
+            ReleaseSlotResources(g_slots[i]);
+            g_slots[i].inUse = false;
+            g_slots[i].origGameHandle = nullptr;
+            break;
+        }
     }
-    if (InFeatureHandle && InFeatureHandle != g_activeFeature) {
+
+    if (InFeatureHandle && !alreadyParked && real_Release) {
         void* f = InFeatureHandle;
         ParkNrFeature(f);
     }
-
-    g_activeScale = 1.0f;
-    g_currentNativeWidth = 0;
-    g_currentNativeHeight = 0;
 }
 
 }
@@ -899,7 +1255,13 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     if (fdwReason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinstDLL);
     } else if (fdwReason == DLL_PROCESS_DETACH && !lpvReserved) {
-        ParkScratch();
+        ReleaseD3D12Pipeline();
+        for (size_t i = 0; i < MAX_FEATURE_SLOTS; ++i) {
+            if (g_slots[i].inUse) {
+                ReleaseSlotResources(g_slots[i]);
+                g_slots[i].inUse = false;
+            }
+        }
         if (g_logFile) {
             fclose(g_logFile);
             g_logFile = nullptr;
