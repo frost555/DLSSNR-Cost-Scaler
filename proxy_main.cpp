@@ -59,10 +59,10 @@ static void Log(const char* fmt, ...) {
 }
 
 static std::atomic<bool>     g_enableProxy(true);
-static std::atomic<float>    g_scale(1.0f);
+static std::atomic<float>    g_scale(0.75f);
 static std::atomic<uint32_t> g_enlargementMode(1);     // 1 = Matched Residual, 0 = Classic Bilinear
 static std::atomic<float>    g_transferStrength(1.0f); // 0.0 to 2.0
-static std::atomic<float>    g_sharpness(0.0f);        // 0.0 to 1.0 (RCAS)
+static std::atomic<float>    g_sharpness(0.20f);       // 0.0 to 1.0 (RCAS)
 static bool                  g_enableHotkeys = true;
 static bool                  g_requireCtrlAlt = true;
 static int                   g_keyToggleProxy = VK_SPACE;
@@ -86,7 +86,7 @@ static void LoadConfig() {
     }
 
     wchar_t scaleBuf[64] = { 0 };
-    GetPrivateProfileStringW(L"DLSSNR_Proxy", L"ResolutionScale", L"1.0", scaleBuf, 64, g_iniPath);
+    GetPrivateProfileStringW(L"DLSSNR_Proxy", L"ResolutionScale", L"0.75", scaleBuf, 64, g_iniPath);
     float val = (float)_wtof(scaleBuf);
     if (val < 0.25f) val = 0.25f;
     if (val > 1.0f) val = 1.0f;
@@ -105,7 +105,7 @@ static void LoadConfig() {
     g_transferStrength.store(tVal);
 
     wchar_t sharpBuf[64] = { 0 };
-    GetPrivateProfileStringW(L"DLSSNR_Proxy", L"Sharpness", L"0.0", sharpBuf, 64, g_iniPath);
+    GetPrivateProfileStringW(L"DLSSNR_Proxy", L"Sharpness", L"0.20", sharpBuf, 64, g_iniPath);
     float sVal = (float)_wtof(sharpBuf);
     if (sVal < 0.0f) sVal = 0.0f;
     if (sVal > 1.0f) sVal = 1.0f;
