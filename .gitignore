@@ -1,0 +1,13 @@
+# Build output files
+*.obj
+*.exp
+*.lib
+*.dll
+*.log
+
+# Visual Studio / compiler temporary files
+.vs/
+*.pdb
+*.ilk
+*.user
+*.suo
