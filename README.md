@@ -38,7 +38,8 @@ Tested specifically with clshortfuse's DLSS addon (`renodx-dlss.addon64`), but a
    nvngx_dlssnr_real.dll
    ```
 3. Copy the proxy `nvngx_dlssnr.dll` and `nvngx_dlssnr.ini` from the release into that same folder.
-4. Launch the game.
+4. *(Optional for ReShade users)*: Copy `dlssnr-companion.addon64` into your game folder to get a live configuration overlay under the ReShade Home menu.
+5. Launch the game.
 
 ---
 
@@ -73,15 +74,36 @@ TransferStrength = 1.00
 ; Contrast-adaptive edge sharpening (0.0 to 1.0, default 0.0)
 Sharpness = 0.20
 
-; Enable in-game silent hotkeys
+; Enable in-game hotkeys
 EnableHotkeys = 1
+
+[Hotkeys]
+; Require Ctrl + Alt modifiers held down with the hotkey (1 = yes, 0 = no)
+RequireCtrlAlt = 1
+
+; Virtual-Key codes (Decimal):
+; Space=32, PageUp=33, PageDown=34, End=35, Home=36, Insert=45, Delete=46
+KeyToggleProxy = 32
+KeyToggleMode = 35
+KeyScaleUp = 33
+KeyScaleDown = 34
 ```
+
+---
+
+## ReShade Companion Addon (`dlssnr-companion.addon64`)
+
+If using ReShade, drop `dlssnr-companion.addon64` into your game directory alongside ReShade.
+
+- **Non-Invasive:** Does not hook graphics draw calls or pipeline passes; operates purely as an overlay tab in the ReShade Home menu.
+- **Debounced Sliders:** Features interactive debouncing to ensure rapid slider adjustments never hitch or cause GPU model thrashing.
+- **In-Game Hotkey Rebinding:** Rebind shortcut keys and modifier requirements directly in the UI.
 
 ---
 
 ## In-Game Hotkeys
 
-When `EnableHotkeys = 1`, the following keyboard shortcuts are active:
+When `EnableHotkeys = 1`, the default shortcuts are:
 
 - `Ctrl + Alt + Space` — Toggle proxy ON / OFF (switches between scaled proxy and native passthrough).
 - `Ctrl + Alt + End` — Toggle EnlargementMode between Matched Residual (`1`) and Bilinear (`0`).

@@ -64,6 +64,11 @@ static std::atomic<uint32_t> g_enlargementMode(1);     // 1 = Matched Residual, 
 static std::atomic<float>    g_transferStrength(1.0f); // 0.0 to 2.0
 static std::atomic<float>    g_sharpness(0.0f);        // 0.0 to 1.0 (RCAS)
 static bool                  g_enableHotkeys = true;
+static bool                  g_requireCtrlAlt = true;
+static int                   g_keyToggleProxy = VK_SPACE;
+static int                   g_keyToggleMode  = VK_END;
+static int                   g_keyScaleUp     = VK_PRIOR;
+static int                   g_keyScaleDown   = VK_NEXT;
 static wchar_t               g_iniPath[MAX_PATH] = { 0 };
 static FILETIME              g_lastIniWriteTime = { 0 };
 
@@ -106,6 +111,12 @@ static void LoadConfig() {
     if (sVal > 1.0f) sVal = 1.0f;
     g_sharpness.store(sVal);
 
+    g_requireCtrlAlt = (GetPrivateProfileIntW(L"Hotkeys", L"RequireCtrlAlt", 1, g_iniPath) != 0);
+    g_keyToggleProxy = GetPrivateProfileIntW(L"Hotkeys", L"KeyToggleProxy", VK_SPACE, g_iniPath);
+    g_keyToggleMode  = GetPrivateProfileIntW(L"Hotkeys", L"KeyToggleMode",  VK_END,   g_iniPath);
+    g_keyScaleUp     = GetPrivateProfileIntW(L"Hotkeys", L"KeyScaleUp",     VK_PRIOR, g_iniPath);
+    g_keyScaleDown   = GetPrivateProfileIntW(L"Hotkeys", L"KeyScaleDown",   VK_NEXT,  g_iniPath);
+
     Log("[Proxy] Config loaded: EnableProxy = %d, ResolutionScale = %.2f, EnlargementMode = %u, TransferStrength = %.2f, Sharpness = %.2f, EnableHotkeys = %d",
         g_enableProxy.load() ? 1 : 0, val, g_enlargementMode.load(), g_transferStrength.load(), g_sharpness.load(), g_enableHotkeys ? 1 : 0);
 }
@@ -131,38 +142,42 @@ static void CheckHotkeys() {
     ULONGLONG now = GetTickCount64();
     if (now - s_lastPress < 250) return;
 
-    bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-    bool alt  = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+    bool modifiersOk = true;
+    if (g_requireCtrlAlt) {
+        bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+        bool alt  = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+        modifiersOk = (ctrl && alt);
+    }
 
-    if (ctrl && alt) {
+    if (modifiersOk) {
         float current = g_scale.load();
-        if ((GetAsyncKeyState(VK_SPACE) & 0x8000) != 0) {
+        if ((GetAsyncKeyState(g_keyToggleProxy) & 0x8000) != 0) {
             bool newState = !g_enableProxy.load();
             g_enableProxy.store(newState);
-            Log("[Proxy] Hotkey Ctrl+Alt+Space: Proxy is now %s", newState ? "ENABLED" : "DISABLED (Native Passthrough)");
+            Log("[Proxy] Hotkey ToggleProxy: Proxy is now %s", newState ? "ENABLED" : "DISABLED (Native Passthrough)");
             s_lastPress = now;
         }
-        else if ((GetAsyncKeyState(VK_END) & 0x8000) != 0) {
+        else if ((GetAsyncKeyState(g_keyToggleMode) & 0x8000) != 0) {
             uint32_t newMode = (g_enlargementMode.load() == 1) ? 0 : 1;
             g_enlargementMode.store(newMode);
-            Log("[Proxy] Hotkey Ctrl+Alt+End: EnlargementMode changed to %s", newMode == 1 ? "Matched Residual" : "Classic Bilinear");
+            Log("[Proxy] Hotkey ToggleMode: EnlargementMode changed to %s", newMode == 1 ? "Matched Residual" : "Classic Bilinear");
             s_lastPress = now;
         }
-        else if ((GetAsyncKeyState(VK_PRIOR) & 0x8000) != 0) {
+        else if ((GetAsyncKeyState(g_keyScaleUp) & 0x8000) != 0) {
             float next = (float)(floor((current + 0.051f) * 20.0f) / 20.0f);
             if (next > 1.0f) next = 1.0f;
             if (next != current) {
                 g_scale.store(next);
-                Log("[Proxy] Hotkey PageUp: Scale changed from %.2f to %.2f", current, next);
+                Log("[Proxy] Hotkey ScaleUp: Scale changed from %.2f to %.2f", current, next);
                 s_lastPress = now;
             }
         }
-        else if ((GetAsyncKeyState(VK_NEXT) & 0x8000) != 0) {
+        else if ((GetAsyncKeyState(g_keyScaleDown) & 0x8000) != 0) {
             float next = (float)(floor((current - 0.049f) * 20.0f) / 20.0f);
             if (next < 0.25f) next = 0.25f;
             if (next != current) {
                 g_scale.store(next);
-                Log("[Proxy] Hotkey PageDown: Scale changed from %.2f to %.2f", current, next);
+                Log("[Proxy] Hotkey ScaleDown: Scale changed from %.2f to %.2f", current, next);
                 s_lastPress = now;
             }
         }

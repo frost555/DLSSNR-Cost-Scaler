@@ -3,6 +3,7 @@
 *.exp
 *.lib
 *.dll
+*.addon64
 *.log
 
 # Visual Studio / compiler temporary files

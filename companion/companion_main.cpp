@@ -1,0 +1,377 @@
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <cstdio>
+#include <cwchar>
+#include <string>
+#include <vector>
+#include <algorithm>
+
+#define ImTextureID ImU64
+#include "imgui.h"
+#include "reshade.hpp"
+
+extern "C" __declspec(dllexport) const char* NAME = "DLSS-NR Cost Scaler";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "Live configuration overlay for the DLSSNR-Cost-Scaler proxy.";
+
+struct KeyBinding {
+    int vk;
+    const char* name;
+};
+
+static const KeyBinding kAvailableKeys[] = {
+    { VK_SPACE,     "Space" },
+    { VK_PRIOR,     "Page Up" },
+    { VK_NEXT,      "Page Down" },
+    { VK_HOME,      "Home" },
+    { VK_END,       "End" },
+    { VK_INSERT,    "Insert" },
+    { VK_DELETE,    "Delete" },
+    { VK_F1,        "F1" },
+    { VK_F2,        "F2" },
+    { VK_F3,        "F3" },
+    { VK_F4,        "F4" },
+    { VK_F5,        "F5" },
+    { VK_F6,        "F6" },
+    { VK_F7,        "F7" },
+    { VK_F8,        "F8" },
+    { VK_F9,        "F9" },
+    { VK_F10,       "F10" },
+    { VK_F11,       "F11" },
+    { VK_F12,       "F12" },
+    { 'A', "A" }, { 'B', "B" }, { 'C', "C" }, { 'D', "D" }, { 'E', "E" },
+    { 'F', "F" }, { 'G', "G" }, { 'H', "H" }, { 'I', "I" }, { 'J', "J" },
+    { 'K', "K" }, { 'L', "L" }, { 'M', "M" }, { 'N', "N" }, { 'O', "O" },
+    { 'P', "P" }, { 'Q', "Q" }, { 'R', "R" }, { 'S', "S" }, { 'T', "T" },
+    { 'U', "U" }, { 'V', "V" }, { 'W', "W" }, { 'X', "X" }, { 'Y', "Y" },
+    { 'Z', "Z" },
+    { VK_NUMPAD0,   "Numpad 0" },
+    { VK_NUMPAD1,   "Numpad 1" },
+    { VK_NUMPAD2,   "Numpad 2" },
+    { VK_NUMPAD3,   "Numpad 3" },
+    { VK_NUMPAD4,   "Numpad 4" },
+    { VK_NUMPAD5,   "Numpad 5" },
+    { VK_NUMPAD6,   "Numpad 6" },
+    { VK_NUMPAD7,   "Numpad 7" },
+    { VK_NUMPAD8,   "Numpad 8" },
+    { VK_NUMPAD9,   "Numpad 9" },
+    { VK_MULTIPLY,  "Numpad *" },
+    { VK_ADD,       "Numpad +" }
+};
+
+static int FindKeyIndex(int vk) {
+    for (int i = 0; i < (int)(sizeof(kAvailableKeys) / sizeof(kAvailableKeys[0])); ++i) {
+        if (kAvailableKeys[i].vk == vk) return i;
+    }
+    return 0;
+}
+
+// Runtime Configuration State
+static bool  s_enableProxy      = true;
+static float s_resolutionScale  = 0.75f;
+static int   s_enlargementMode  = 1; // 1 = Matched Residual, 0 = Bilinear
+static float s_transferStrength = 1.00f;
+static float s_sharpness        = 0.20f;
+static bool  s_enableHotkeys    = true;
+static bool  s_requireCtrlAlt   = true;
+static int   s_keyToggleProxy   = VK_SPACE;
+static int   s_keyToggleMode    = VK_END;
+static int   s_keyScaleUp       = VK_PRIOR;
+static int   s_keyScaleDown     = VK_NEXT;
+
+// Debounce & Notification State
+static bool      s_dirty          = false;
+static ULONGLONG s_lastChangeTick = 0;
+static constexpr ULONGLONG DEBOUNCE_DELAY_MS = 250;
+static char      s_statusMsg[128] = "Synced with nvngx_dlssnr.ini";
+static ULONGLONG s_statusMsgTick  = 0;
+static FILETIME  s_lastDiskWriteTime = { 0, 0 };
+
+static std::wstring GetIniFilePath() {
+    wchar_t exePath[MAX_PATH] = { 0 };
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    wchar_t* lastSlash = wcsrchr(exePath, L'\\');
+    if (lastSlash) *(lastSlash + 1) = L'\0';
+    return std::wstring(exePath) + L"nvngx_dlssnr.ini";
+}
+
+static void LoadIniSettings() {
+    std::wstring iniPath = GetIniFilePath();
+
+    WIN32_FILE_ATTRIBUTE_DATA fileInfo;
+    if (GetFileAttributesExW(iniPath.c_str(), GetFileExInfoStandard, &fileInfo)) {
+        s_lastDiskWriteTime = fileInfo.ftLastWriteTime;
+    }
+
+    s_enableProxy = (GetPrivateProfileIntW(L"DLSSNR_Proxy", L"EnableProxy", 1, iniPath.c_str()) != 0);
+
+    wchar_t scaleBuf[64] = { 0 };
+    GetPrivateProfileStringW(L"DLSSNR_Proxy", L"ResolutionScale", L"0.75", scaleBuf, 64, iniPath.c_str());
+    float val = (float)_wtof(scaleBuf);
+    if (val < 0.25f) val = 0.25f;
+    if (val > 1.00f) val = 1.00f;
+    s_resolutionScale = val;
+
+    s_enlargementMode = GetPrivateProfileIntW(L"DLSSNR_Proxy", L"EnlargementMode", 1, iniPath.c_str());
+    if (s_enlargementMode != 0 && s_enlargementMode != 1) s_enlargementMode = 1;
+
+    wchar_t transferBuf[64] = { 0 };
+    GetPrivateProfileStringW(L"DLSSNR_Proxy", L"TransferStrength", L"1.00", transferBuf, 64, iniPath.c_str());
+    float tVal = (float)_wtof(transferBuf);
+    if (tVal < 0.0f) tVal = 0.0f;
+    if (tVal > 2.0f) tVal = 2.0f;
+    s_transferStrength = tVal;
+
+    wchar_t sharpBuf[64] = { 0 };
+    GetPrivateProfileStringW(L"DLSSNR_Proxy", L"Sharpness", L"0.20", sharpBuf, 64, iniPath.c_str());
+    float sVal = (float)_wtof(sharpBuf);
+    if (sVal < 0.0f) sVal = 0.0f;
+    if (sVal > 1.0f) sVal = 1.0f;
+    s_sharpness = sVal;
+
+    s_enableHotkeys  = (GetPrivateProfileIntW(L"DLSSNR_Proxy", L"EnableHotkeys", 1, iniPath.c_str()) != 0);
+    s_requireCtrlAlt = (GetPrivateProfileIntW(L"Hotkeys", L"RequireCtrlAlt", 1, iniPath.c_str()) != 0);
+    s_keyToggleProxy = GetPrivateProfileIntW(L"Hotkeys", L"KeyToggleProxy", VK_SPACE, iniPath.c_str());
+    s_keyToggleMode  = GetPrivateProfileIntW(L"Hotkeys", L"KeyToggleMode",  VK_END,   iniPath.c_str());
+    s_keyScaleUp     = GetPrivateProfileIntW(L"Hotkeys", L"KeyScaleUp",     VK_PRIOR, iniPath.c_str());
+    s_keyScaleDown   = GetPrivateProfileIntW(L"Hotkeys", L"KeyScaleDown",   VK_NEXT,  iniPath.c_str());
+}
+
+static void SaveIniSettings() {
+    std::wstring iniPath = GetIniFilePath();
+
+    wchar_t buf[64];
+
+    swprintf_s(buf, L"%d", s_enableProxy ? 1 : 0);
+    WritePrivateProfileStringW(L"DLSSNR_Proxy", L"EnableProxy", buf, iniPath.c_str());
+
+    swprintf_s(buf, L"%.2f", s_resolutionScale);
+    WritePrivateProfileStringW(L"DLSSNR_Proxy", L"ResolutionScale", buf, iniPath.c_str());
+
+    swprintf_s(buf, L"%d", s_enlargementMode);
+    WritePrivateProfileStringW(L"DLSSNR_Proxy", L"EnlargementMode", buf, iniPath.c_str());
+
+    swprintf_s(buf, L"%.2f", s_transferStrength);
+    WritePrivateProfileStringW(L"DLSSNR_Proxy", L"TransferStrength", buf, iniPath.c_str());
+
+    swprintf_s(buf, L"%.2f", s_sharpness);
+    WritePrivateProfileStringW(L"DLSSNR_Proxy", L"Sharpness", buf, iniPath.c_str());
+
+    swprintf_s(buf, L"%d", s_enableHotkeys ? 1 : 0);
+    WritePrivateProfileStringW(L"DLSSNR_Proxy", L"EnableHotkeys", buf, iniPath.c_str());
+
+    // Hotkey bindings section
+    swprintf_s(buf, L"%d", s_requireCtrlAlt ? 1 : 0);
+    WritePrivateProfileStringW(L"Hotkeys", L"RequireCtrlAlt", buf, iniPath.c_str());
+
+    swprintf_s(buf, L"%d", s_keyToggleProxy);
+    WritePrivateProfileStringW(L"Hotkeys", L"KeyToggleProxy", buf, iniPath.c_str());
+
+    swprintf_s(buf, L"%d", s_keyToggleMode);
+    WritePrivateProfileStringW(L"Hotkeys", L"KeyToggleMode", buf, iniPath.c_str());
+
+    swprintf_s(buf, L"%d", s_keyScaleUp);
+    WritePrivateProfileStringW(L"Hotkeys", L"KeyScaleUp", buf, iniPath.c_str());
+
+    swprintf_s(buf, L"%d", s_keyScaleDown);
+    WritePrivateProfileStringW(L"Hotkeys", L"KeyScaleDown", buf, iniPath.c_str());
+
+    WIN32_FILE_ATTRIBUTE_DATA fileInfo;
+    if (GetFileAttributesExW(iniPath.c_str(), GetFileExInfoStandard, &fileInfo)) {
+        s_lastDiskWriteTime = fileInfo.ftLastWriteTime;
+    }
+}
+
+static void PollDiskChanges() {
+    if (s_dirty) return;
+
+    static ULONGLONG s_lastCheck = 0;
+    ULONGLONG now = GetTickCount64();
+    if (now - s_lastCheck < 1000) return;
+    s_lastCheck = now;
+
+    std::wstring iniPath = GetIniFilePath();
+    WIN32_FILE_ATTRIBUTE_DATA fileInfo;
+    if (GetFileAttributesExW(iniPath.c_str(), GetFileExInfoStandard, &fileInfo)) {
+        if (CompareFileTime(&fileInfo.ftLastWriteTime, &s_lastDiskWriteTime) != 0) {
+            LoadIniSettings();
+        }
+    }
+}
+
+static void DrawKeySelector(const char* label, int* currentVk) {
+    int currentIdx = FindKeyIndex(*currentVk);
+    int totalKeys = (int)(sizeof(kAvailableKeys) / sizeof(kAvailableKeys[0]));
+
+    if (ImGui::BeginCombo(label, kAvailableKeys[currentIdx].name)) {
+        for (int i = 0; i < totalKeys; ++i) {
+            bool isSelected = (i == currentIdx);
+            if (ImGui::Selectable(kAvailableKeys[i].name, isSelected)) {
+                *currentVk = kAvailableKeys[i].vk;
+                s_dirty = true;
+                s_lastChangeTick = 0;
+            }
+            if (isSelected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+}
+
+static void DrawOverlay(reshade::api::effect_runtime* /*runtime*/) {
+    PollDiskChanges();
+
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
+
+    ImGui::TextColored(ImVec4(0.35f, 0.75f, 1.00f, 1.00f), "DLSS-NR Cost Scaler");
+    ImGui::SameLine();
+    if (s_enableProxy) {
+        ImGui::TextColored(ImVec4(0.20f, 0.90f, 0.30f, 1.00f), "[ACTIVE]");
+    } else {
+        ImGui::TextColored(ImVec4(0.70f, 0.70f, 0.70f, 1.00f), "[BYPASSED]");
+    }
+
+    ImGui::Separator();
+
+    if (ImGui::Checkbox("Enable Proxy", &s_enableProxy)) {
+        s_dirty = true;
+        s_lastChangeTick = 0;
+    }
+
+    if (!s_enableProxy) {
+        ImGui::TextDisabled("Proxy is disabled. DLSS-NR runs at 100% native resolution with zero scaling.");
+    } else {
+        char scaleLabel[64];
+        float pixelPct = (1.0f - (s_resolutionScale * s_resolutionScale)) * 100.0f;
+        snprintf(scaleLabel, sizeof(scaleLabel), "%.2f (%.0f%% fewer pixels)", s_resolutionScale, pixelPct);
+
+        if (ImGui::SliderFloat("Resolution Scale", &s_resolutionScale, 0.25f, 1.00f, scaleLabel)) {
+            s_dirty = true;
+            s_lastChangeTick = GetTickCount64();
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            s_dirty = true;
+            s_lastChangeTick = 0;
+        }
+
+        ImGui::Text("Quick Presets:");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("75% (Sweet Spot)")) {
+            s_resolutionScale = 0.75f;
+            s_dirty = true;
+            s_lastChangeTick = 0;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("85% (1440p)")) {
+            s_resolutionScale = 0.85f;
+            s_dirty = true;
+            s_lastChangeTick = 0;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("100% (Native)")) {
+            s_resolutionScale = 1.00f;
+            s_dirty = true;
+            s_lastChangeTick = 0;
+        }
+
+        const char* modeItems[] = {
+            "Classic Bilinear (0) - Debug / Stretched Upscale",
+            "Matched Residual (1) - 1:1 Pristine Detail + Neural Delta"
+        };
+        int currentModeIdx = (s_enlargementMode == 1) ? 1 : 0;
+        if (ImGui::Combo("Resolve Mode", &currentModeIdx, modeItems, 2)) {
+            s_enlargementMode = (currentModeIdx == 1) ? 1 : 0;
+            s_dirty = true;
+            s_lastChangeTick = 0;
+        }
+
+        if (ImGui::SliderFloat("RCAS Sharpness", &s_sharpness, 0.00f, 1.00f, "%.2f")) {
+            s_dirty = true;
+            s_lastChangeTick = GetTickCount64();
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            s_dirty = true;
+            s_lastChangeTick = 0;
+        }
+
+        if (ImGui::SliderFloat("Transfer Strength", &s_transferStrength, 0.00f, 2.00f, "%.2f")) {
+            s_dirty = true;
+            s_lastChangeTick = GetTickCount64();
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            s_dirty = true;
+            s_lastChangeTick = 0;
+        }
+    }
+
+    ImGui::Separator();
+
+    if (ImGui::CollapsingHeader("Hotkey Configuration", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::Checkbox("Enable In-Game Hotkeys", &s_enableHotkeys)) {
+            s_dirty = true;
+            s_lastChangeTick = 0;
+        }
+
+        if (s_enableHotkeys) {
+            if (ImGui::Checkbox("Require Ctrl + Alt Modifiers", &s_requireCtrlAlt)) {
+                s_dirty = true;
+                s_lastChangeTick = 0;
+            }
+
+            DrawKeySelector("Toggle Proxy Key", &s_keyToggleProxy);
+            DrawKeySelector("Toggle Resolve Mode Key", &s_keyToggleMode);
+            DrawKeySelector("Scale Up (+5%) Key", &s_keyScaleUp);
+            DrawKeySelector("Scale Down (-5%) Key", &s_keyScaleDown);
+
+            const char* prefix = s_requireCtrlAlt ? "Ctrl + Alt + " : "";
+            int kProxyIdx = FindKeyIndex(s_keyToggleProxy);
+            int kUpIdx    = FindKeyIndex(s_keyScaleUp);
+            int kDownIdx  = FindKeyIndex(s_keyScaleDown);
+            ImGui::TextDisabled("Shortcuts: %s%s (Toggle) | %s%s / %s%s (Scale +/-)",
+                prefix, kAvailableKeys[kProxyIdx].name,
+                prefix, kAvailableKeys[kUpIdx].name,
+                prefix, kAvailableKeys[kDownIdx].name);
+        }
+    }
+
+    ImGui::Separator();
+
+    ULONGLONG now = GetTickCount64();
+    if (s_dirty) {
+        if (s_lastChangeTick == 0 || (now - s_lastChangeTick >= DEBOUNCE_DELAY_MS)) {
+            SaveIniSettings();
+            s_dirty = false;
+            snprintf(s_statusMsg, sizeof(s_statusMsg), "Saved to nvngx_dlssnr.ini (Scale=%.2f, Sharp=%.2f)", s_resolutionScale, s_sharpness);
+            s_statusMsgTick = now;
+        } else {
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Applying changes...");
+        }
+    }
+
+    if (!s_dirty) {
+        if (now - s_statusMsgTick < 4000) {
+            ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "? %s", s_statusMsg);
+        } else {
+            ImGui::TextDisabled("All settings saved and active in nvngx_dlssnr.ini");
+        }
+    }
+
+    ImGui::PopStyleVar(2);
+}
+
+BOOL WINAPI DllMain(HMODULE hModule, DWORD fdwReason, LPVOID) {
+    switch (fdwReason) {
+    case DLL_PROCESS_ATTACH:
+        if (!reshade::register_addon(hModule))
+            return FALSE;
+        LoadIniSettings();
+        reshade::register_overlay("DLSS-NR Cost Scaler", DrawOverlay);
+        break;
+    case DLL_PROCESS_DETACH:
+        reshade::unregister_overlay("DLSS-NR Cost Scaler", DrawOverlay);
+        reshade::unregister_addon(hModule);
+        break;
+    }
+    return TRUE;
+}
