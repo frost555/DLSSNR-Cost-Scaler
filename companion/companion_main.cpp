@@ -1,4 +1,4 @@
-#define WIN32_LEAN_AND_MEAN
+﻿#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <cstdio>
 #include <cwchar>
@@ -224,12 +224,12 @@ static void DrawOverlay(reshade::api::effect_runtime* /*runtime*/) {
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
 
-    ImGui::TextColored(ImVec4(0.35f, 0.75f, 1.00f, 1.00f), "DLSS-NR Cost Scaler");
+    ImGui::TextColored(ImVec4(0.35f, 0.75f, 1.00f, 1.00f), "%s", "DLSS-NR Cost Scaler");
     ImGui::SameLine();
     if (s_enableProxy) {
-        ImGui::TextColored(ImVec4(0.20f, 0.90f, 0.30f, 1.00f), "[ACTIVE]");
+        ImGui::TextColored(ImVec4(0.20f, 0.90f, 0.30f, 1.00f), "%s", "[ACTIVE]");
     } else {
-        ImGui::TextColored(ImVec4(0.70f, 0.70f, 0.70f, 1.00f), "[BYPASSED]");
+        ImGui::TextColored(ImVec4(0.70f, 0.70f, 0.70f, 1.00f), "%s", "[BYPASSED]");
     }
 
     ImGui::Separator();
@@ -240,13 +240,9 @@ static void DrawOverlay(reshade::api::effect_runtime* /*runtime*/) {
     }
 
     if (!s_enableProxy) {
-        ImGui::TextDisabled("Proxy is disabled. DLSS-NR runs at 100% native resolution with zero scaling.");
+        ImGui::TextDisabled("%s", "Proxy is disabled. DLSS-NR runs at native resolution with zero scaling.");
     } else {
-        char scaleLabel[64];
-        float pixelPct = (1.0f - (s_resolutionScale * s_resolutionScale)) * 100.0f;
-        snprintf(scaleLabel, sizeof(scaleLabel), "%.2f (%.0f%% fewer pixels)", s_resolutionScale, pixelPct);
-
-        if (ImGui::SliderFloat("Resolution Scale", &s_resolutionScale, 0.25f, 1.00f, scaleLabel)) {
+        if (ImGui::SliderFloat("Resolution Scale", &s_resolutionScale, 0.25f, 1.00f, "%.2f")) {
             s_dirty = true;
             s_lastChangeTick = GetTickCount64();
         }
@@ -255,7 +251,13 @@ static void DrawOverlay(reshade::api::effect_runtime* /*runtime*/) {
             s_lastChangeTick = 0;
         }
 
-        ImGui::Text("Quick Presets:");
+        if (s_resolutionScale < 0.999f) {
+            float pixelPct = (1.0f - (s_resolutionScale * s_resolutionScale)) * 100.0f;
+            ImGui::SameLine();
+            ImGui::TextDisabled("(%.0f%% fewer pixels)", pixelPct);
+        }
+
+        ImGui::TextUnformatted("Quick Presets:");
         ImGui::SameLine();
         if (ImGui::SmallButton("75% (Sweet Spot)")) {
             s_resolutionScale = 0.75f;
@@ -345,15 +347,15 @@ static void DrawOverlay(reshade::api::effect_runtime* /*runtime*/) {
             snprintf(s_statusMsg, sizeof(s_statusMsg), "Saved to nvngx_dlssnr.ini (Scale=%.2f, Sharp=%.2f)", s_resolutionScale, s_sharpness);
             s_statusMsgTick = now;
         } else {
-            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Applying changes...");
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "%s", "Applying changes...");
         }
     }
 
     if (!s_dirty) {
         if (now - s_statusMsgTick < 4000) {
-            ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "? %s", s_statusMsg);
+            ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "Saved: %s", s_statusMsg);
         } else {
-            ImGui::TextDisabled("All settings saved and active in nvngx_dlssnr.ini");
+            ImGui::TextDisabled("%s", "All settings saved and active in nvngx_dlssnr.ini");
         }
     }
 

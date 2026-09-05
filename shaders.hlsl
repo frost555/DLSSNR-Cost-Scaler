@@ -154,8 +154,15 @@ void CS_Resolve(uint3 id : SV_DispatchThreadID)
         float range = maxL - minL;
         if (range > 1e-5)
         {
-            float weight = saturate(gSharpness) * clamp(-0.2, 0.0, -0.15 * (1.0 - range / (maxL + 1e-4)));
-            result = max(result - weight * (cE + cW + cS + cN - 4.0 * original), 0.0);
+            // Contrast-adaptive unsharp masking
+            float3 crossAvg = (cE + cW + cS + cN) * 0.25;
+            float3 highFreq = original - crossAvg;
+
+            // Dampen on high-contrast edges to prevent haloing, amplify subtle texture detail
+            float adaptiveScale = saturate(1.0 - range / (maxL + 1e-4));
+            float rcasWeight = saturate(gSharpness) * (0.2 + 0.8 * adaptiveScale);
+
+            result = max(result + highFreq * rcasWeight, 0.0);
         }
     }
 
