@@ -1,4 +1,4 @@
-﻿#define WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <cstdio>
 #include <cwchar>
@@ -70,6 +70,7 @@ static bool  s_enableProxy      = true;
 static float s_resolutionScale  = 0.75f;
 static int   s_enlargementMode  = 1; // 1 = Matched Residual, 0 = Bilinear
 static float s_transferStrength = 1.00f;
+static float s_colorStrength    = 1.00f;
 static float s_sharpness        = 0.20f;
 static bool  s_enableHotkeys    = true;
 static bool  s_requireCtrlAlt   = true;
@@ -121,6 +122,13 @@ static void LoadIniSettings() {
     if (tVal > 2.0f) tVal = 2.0f;
     s_transferStrength = tVal;
 
+    wchar_t colorBuf[64] = { 0 };
+    GetPrivateProfileStringW(L"DLSSNR_Proxy", L"ColorStrength", L"1.00", colorBuf, 64, iniPath.c_str());
+    float cVal = (float)_wtof(colorBuf);
+    if (cVal < 0.0f) cVal = 0.0f;
+    if (cVal > 1.0f) cVal = 1.0f;
+    s_colorStrength = cVal;
+
     wchar_t sharpBuf[64] = { 0 };
     GetPrivateProfileStringW(L"DLSSNR_Proxy", L"Sharpness", L"0.20", sharpBuf, 64, iniPath.c_str());
     float sVal = (float)_wtof(sharpBuf);
@@ -152,6 +160,9 @@ static void SaveIniSettings() {
 
     swprintf_s(buf, L"%.2f", s_transferStrength);
     WritePrivateProfileStringW(L"DLSSNR_Proxy", L"TransferStrength", buf, iniPath.c_str());
+
+    swprintf_s(buf, L"%.2f", s_colorStrength);
+    WritePrivateProfileStringW(L"DLSSNR_Proxy", L"ColorStrength", buf, iniPath.c_str());
 
     swprintf_s(buf, L"%.2f", s_sharpness);
     WritePrivateProfileStringW(L"DLSSNR_Proxy", L"Sharpness", buf, iniPath.c_str());
@@ -186,7 +197,7 @@ static void PollDiskChanges() {
 
     static ULONGLONG s_lastCheck = 0;
     ULONGLONG now = GetTickCount64();
-    if (now - s_lastCheck < 1000) return;
+    if (now - s_lastCheck < 250) return;
     s_lastCheck = now;
 
     std::wstring iniPath = GetIniFilePath();
@@ -278,8 +289,8 @@ static void DrawOverlay(reshade::api::effect_runtime* /*runtime*/) {
         }
 
         const char* modeItems[] = {
-            "Classic Bilinear (0) - Debug / Stretched Upscale",
-            "Matched Residual (1) - 1:1 Pristine Detail + Neural Delta"
+            "Direct Neural + RCAS (0) - Clean Denoised (Recommended)",
+            "Luminance Hybrid (1) - Blends Native with Neural Light"
         };
         int currentModeIdx = (s_enlargementMode == 1) ? 1 : 0;
         if (ImGui::Combo("Resolve Mode", &currentModeIdx, modeItems, 2)) {
@@ -298,6 +309,15 @@ static void DrawOverlay(reshade::api::effect_runtime* /*runtime*/) {
         }
 
         if (ImGui::SliderFloat("Transfer Strength", &s_transferStrength, 0.00f, 2.00f, "%.2f")) {
+            s_dirty = true;
+            s_lastChangeTick = GetTickCount64();
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            s_dirty = true;
+            s_lastChangeTick = 0;
+        }
+
+        if (ImGui::SliderFloat("Color Strength", &s_colorStrength, 0.00f, 1.00f, "%.2f")) {
             s_dirty = true;
             s_lastChangeTick = GetTickCount64();
         }

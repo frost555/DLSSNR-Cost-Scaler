@@ -63,6 +63,7 @@ static std::atomic<float>    g_scale(0.75f);
 static std::atomic<uint32_t> g_enlargementMode(1);     // 1 = Matched Residual, 0 = Classic Bilinear
 static std::atomic<float>    g_transferStrength(1.0f); // 0.0 to 2.0
 static std::atomic<float>    g_sharpness(0.20f);       // 0.0 to 1.0 (RCAS)
+static std::atomic<float>    g_colorStrength(1.00f);   // 0.0 to 1.0 (Issue #5)
 static bool                  g_enableHotkeys = true;
 static bool                  g_requireCtrlAlt = true;
 static int                   g_keyToggleProxy = VK_SPACE;
@@ -71,6 +72,15 @@ static int                   g_keyScaleUp     = VK_PRIOR;
 static int                   g_keyScaleDown   = VK_NEXT;
 static wchar_t               g_iniPath[MAX_PATH] = { 0 };
 static FILETIME              g_lastIniWriteTime = { 0 };
+
+static void SaveConfigValue(const wchar_t* key, const wchar_t* value) {
+    if (g_iniPath[0] == L'\0') return;
+    WritePrivateProfileStringW(L"DLSSNR_Proxy", key, value, g_iniPath);
+    WIN32_FILE_ATTRIBUTE_DATA fileInfo;
+    if (GetFileAttributesExW(g_iniPath, GetFileExInfoStandard, &fileInfo)) {
+        g_lastIniWriteTime = fileInfo.ftLastWriteTime;
+    }
+}
 
 static void LoadConfig() {
     if (g_iniPath[0] == L'\0') {
@@ -98,7 +108,7 @@ static void LoadConfig() {
     g_enlargementMode.store((uint32_t)GetPrivateProfileIntW(L"DLSSNR_Proxy", L"EnlargementMode", 1, g_iniPath));
 
     wchar_t transferBuf[64] = { 0 };
-    GetPrivateProfileStringW(L"DLSSNR_Proxy", L"TransferStrength", L"1.0", transferBuf, 64, g_iniPath);
+    GetPrivateProfileStringW(L"DLSSNR_Proxy", L"TransferStrength", L"1.00", transferBuf, 64, g_iniPath);
     float tVal = (float)_wtof(transferBuf);
     if (tVal < 0.0f) tVal = 0.0f;
     if (tVal > 2.0f) tVal = 2.0f;
@@ -111,14 +121,21 @@ static void LoadConfig() {
     if (sVal > 1.0f) sVal = 1.0f;
     g_sharpness.store(sVal);
 
+    wchar_t colorBuf[64] = { 0 };
+    GetPrivateProfileStringW(L"DLSSNR_Proxy", L"ColorStrength", L"1.00", colorBuf, 64, g_iniPath);
+    float cVal = (float)_wtof(colorBuf);
+    if (cVal < 0.0f) cVal = 0.0f;
+    if (cVal > 1.0f) cVal = 1.0f;
+    g_colorStrength.store(cVal);
+
     g_requireCtrlAlt = (GetPrivateProfileIntW(L"Hotkeys", L"RequireCtrlAlt", 1, g_iniPath) != 0);
     g_keyToggleProxy = GetPrivateProfileIntW(L"Hotkeys", L"KeyToggleProxy", VK_SPACE, g_iniPath);
     g_keyToggleMode  = GetPrivateProfileIntW(L"Hotkeys", L"KeyToggleMode",  VK_END,   g_iniPath);
     g_keyScaleUp     = GetPrivateProfileIntW(L"Hotkeys", L"KeyScaleUp",     VK_PRIOR, g_iniPath);
     g_keyScaleDown   = GetPrivateProfileIntW(L"Hotkeys", L"KeyScaleDown",   VK_NEXT,  g_iniPath);
 
-    Log("[Proxy] Config loaded: EnableProxy = %d, ResolutionScale = %.2f, EnlargementMode = %u, TransferStrength = %.2f, Sharpness = %.2f, EnableHotkeys = %d",
-        g_enableProxy.load() ? 1 : 0, val, g_enlargementMode.load(), g_transferStrength.load(), g_sharpness.load(), g_enableHotkeys ? 1 : 0);
+    Log("[Proxy] Config loaded: EnableProxy = %d, ResolutionScale = %.2f, EnlargementMode = %u, TransferStrength = %.2f, Sharpness = %.2f, ColorStrength = %.2f, EnableHotkeys = %d",
+        g_enableProxy.load() ? 1 : 0, val, g_enlargementMode.load(), g_transferStrength.load(), g_sharpness.load(), g_colorStrength.load(), g_enableHotkeys ? 1 : 0);
 }
 
 static void CheckConfigHotReload() {
@@ -154,13 +171,19 @@ static void CheckHotkeys() {
         if ((GetAsyncKeyState(g_keyToggleProxy) & 0x8000) != 0) {
             bool newState = !g_enableProxy.load();
             g_enableProxy.store(newState);
-            Log("[Proxy] Hotkey ToggleProxy: Proxy is now %s", newState ? "ENABLED" : "DISABLED (Native Passthrough)");
+            wchar_t buf[16];
+            swprintf_s(buf, L"%d", newState ? 1 : 0);
+            SaveConfigValue(L"EnableProxy", buf);
+            Log("[Proxy] Hotkey ToggleProxy: Proxy is now %s (synced to INI)", newState ? "ENABLED" : "DISABLED (Native Passthrough)");
             s_lastPress = now;
         }
         else if ((GetAsyncKeyState(g_keyToggleMode) & 0x8000) != 0) {
             uint32_t newMode = (g_enlargementMode.load() == 1) ? 0 : 1;
             g_enlargementMode.store(newMode);
-            Log("[Proxy] Hotkey ToggleMode: EnlargementMode changed to %s", newMode == 1 ? "Matched Residual" : "Classic Bilinear");
+            wchar_t buf[16];
+            swprintf_s(buf, L"%u", newMode);
+            SaveConfigValue(L"EnlargementMode", buf);
+            Log("[Proxy] Hotkey ToggleMode: EnlargementMode changed to %s (synced to INI)", newMode == 1 ? "Matched Residual" : "Classic Bilinear");
             s_lastPress = now;
         }
         else if ((GetAsyncKeyState(g_keyScaleUp) & 0x8000) != 0) {
@@ -168,7 +191,10 @@ static void CheckHotkeys() {
             if (next > 1.0f) next = 1.0f;
             if (next != current) {
                 g_scale.store(next);
-                Log("[Proxy] Hotkey ScaleUp: Scale changed from %.2f to %.2f", current, next);
+                wchar_t buf[16];
+                swprintf_s(buf, L"%.2f", next);
+                SaveConfigValue(L"ResolutionScale", buf);
+                Log("[Proxy] Hotkey ScaleUp: Scale changed from %.2f to %.2f (synced to INI)", current, next);
                 s_lastPress = now;
             }
         }
@@ -177,7 +203,10 @@ static void CheckHotkeys() {
             if (next < 0.25f) next = 0.25f;
             if (next != current) {
                 g_scale.store(next);
-                Log("[Proxy] Hotkey ScaleDown: Scale changed from %.2f to %.2f", current, next);
+                wchar_t buf[16];
+                swprintf_s(buf, L"%.2f", next);
+                SaveConfigValue(L"ResolutionScale", buf);
+                Log("[Proxy] Hotkey ScaleDown: Scale changed from %.2f to %.2f (synced to INI)", current, next);
                 s_lastPress = now;
             }
         }
@@ -319,7 +348,7 @@ struct ResolveConstants {
     float    transferStrength;
     float    sharpness;
     uint32_t enlargementMode;
-    uint32_t pad0;
+    float    colorStrength;
 };
 
 static ID3D12Device*             g_device = nullptr;
@@ -332,6 +361,7 @@ static ID3D12DescriptorHeap*     g_descHeap = nullptr;
 // Multi-Slot Feature Cache to support concurrent viewports and hooks (e.g. MSFS 2024 Upscaled + Present)
 struct FeatureSlot {
     bool                inUse = false;
+    uint32_t            passIndex = 0;
     const void*         origGameHandle = nullptr;
     void*               activeFeature = nullptr;
     uint32_t            nativeW = 0;
@@ -341,6 +371,7 @@ struct FeatureSlot {
     DXGI_FORMAT         colorFormat = DXGI_FORMAT_UNKNOWN;
     DXGI_FORMAT         scratchFormat = DXGI_FORMAT_UNKNOWN;
     float               scale = 1.0f;
+    int                 skipEvaluateFrames = 0;
 
     ID3D12Resource*     colorSmall = nullptr;
     ID3D12Resource*     outputSmall = nullptr;
@@ -350,6 +381,8 @@ struct FeatureSlot {
     D3D12_RESOURCE_STATES nativeScratchState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 
     ULONGLONG           lastUsedTick = 0;
+    ULONGLONG           lastAllocAttemptTick = 0;
+    ULONGLONG           lastCreateAttemptTick = 0;
 };
 
 static constexpr size_t MAX_FEATURE_SLOTS = 4;
@@ -476,12 +509,19 @@ static bool InitD3D12Pipeline(ID3D12Device* device) {
 
         ID3DBlob* signatureBlob = nullptr;
         ID3DBlob* errorBlob = nullptr;
-        if (FAILED(D3D12SerializeRootSignature(&downRootDesc, D3D_ROOT_SIGNATURE_VERSION_1, &signatureBlob, &errorBlob))) {
-            if (errorBlob) errorBlob->Release();
+        HRESULT hr = D3D12SerializeRootSignature(&downRootDesc, D3D_ROOT_SIGNATURE_VERSION_1, &signatureBlob, &errorBlob);
+        if (FAILED(hr)) {
+            Log("[Proxy] D3D12SerializeRootSignature (down) failed (hr=0x%08X)", hr);
+            if (errorBlob) {
+                Log("[Proxy] > %s", (const char*)errorBlob->GetBufferPointer());
+                errorBlob->Release();
+            }
             return false;
         }
 
-        if (FAILED(device->CreateRootSignature(0, signatureBlob->GetBufferPointer(), signatureBlob->GetBufferSize(), IID_PPV_ARGS(&g_rootSigDownsample)))) {
+        hr = device->CreateRootSignature(0, signatureBlob->GetBufferPointer(), signatureBlob->GetBufferSize(), IID_PPV_ARGS(&g_rootSigDownsample));
+        if (FAILED(hr)) {
+            Log("[Proxy] CreateRootSignature (down) failed (hr=0x%08X)", hr);
             signatureBlob->Release();
             return false;
         }
@@ -530,12 +570,19 @@ static bool InitD3D12Pipeline(ID3D12Device* device) {
 
         ID3DBlob* signatureBlob = nullptr;
         ID3DBlob* errorBlob = nullptr;
-        if (FAILED(D3D12SerializeRootSignature(&resolveRootDesc, D3D_ROOT_SIGNATURE_VERSION_1, &signatureBlob, &errorBlob))) {
-            if (errorBlob) errorBlob->Release();
+        HRESULT hr = D3D12SerializeRootSignature(&resolveRootDesc, D3D_ROOT_SIGNATURE_VERSION_1, &signatureBlob, &errorBlob);
+        if (FAILED(hr)) {
+            Log("[Proxy] D3D12SerializeRootSignature (resolve) failed (hr=0x%08X)", hr);
+            if (errorBlob) {
+                Log("[Proxy] > %s", (const char*)errorBlob->GetBufferPointer());
+                errorBlob->Release();
+            }
             return false;
         }
 
-        if (FAILED(device->CreateRootSignature(0, signatureBlob->GetBufferPointer(), signatureBlob->GetBufferSize(), IID_PPV_ARGS(&g_rootSigResolve)))) {
+        hr = device->CreateRootSignature(0, signatureBlob->GetBufferPointer(), signatureBlob->GetBufferSize(), IID_PPV_ARGS(&g_rootSigResolve));
+        if (FAILED(hr)) {
+            Log("[Proxy] CreateRootSignature (resolve) failed (hr=0x%08X)", hr);
             signatureBlob->Release();
             return false;
         }
@@ -545,14 +592,18 @@ static bool InitD3D12Pipeline(ID3D12Device* device) {
     D3D12_COMPUTE_PIPELINE_STATE_DESC downPsoDesc = {};
     downPsoDesc.pRootSignature = g_rootSigDownsample;
     downPsoDesc.CS = { g_DownsampleShader, sizeof(g_DownsampleShader) };
-    if (FAILED(device->CreateComputePipelineState(&downPsoDesc, IID_PPV_ARGS(&g_psoDownsample)))) {
+    HRESULT hrPso = device->CreateComputePipelineState(&downPsoDesc, IID_PPV_ARGS(&g_psoDownsample));
+    if (FAILED(hrPso)) {
+        Log("[Proxy] CreateComputePipelineState (down) failed (hr=0x%08X)", hrPso);
         return false;
     }
 
     D3D12_COMPUTE_PIPELINE_STATE_DESC resolvePsoDesc = {};
     resolvePsoDesc.pRootSignature = g_rootSigResolve;
     resolvePsoDesc.CS = { g_ResolveShader, sizeof(g_ResolveShader) };
-    if (FAILED(device->CreateComputePipelineState(&resolvePsoDesc, IID_PPV_ARGS(&g_psoResolve)))) {
+    hrPso = device->CreateComputePipelineState(&resolvePsoDesc, IID_PPV_ARGS(&g_psoResolve));
+    if (FAILED(hrPso)) {
+        Log("[Proxy] CreateComputePipelineState (resolve) failed (hr=0x%08X)", hrPso);
         return false;
     }
 
@@ -561,7 +612,9 @@ static bool InitD3D12Pipeline(ID3D12Device* device) {
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 
-    if (FAILED(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&g_descHeap)))) {
+    HRESULT hrHeap = device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&g_descHeap));
+    if (FAILED(hrHeap)) {
+        Log("[Proxy] CreateDescriptorHeap failed (hr=0x%08X)", hrHeap);
         return false;
     }
 
@@ -570,6 +623,7 @@ static bool InitD3D12Pipeline(ID3D12Device* device) {
 }
 
 static ID3D12Resource* CreateScratchTexture(ID3D12Device* device, DXGI_FORMAT format, uint32_t width, uint32_t height) {
+    if (!device) return nullptr;
     D3D12_HEAP_PROPERTIES heap = {};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
 
@@ -593,7 +647,15 @@ static ID3D12Resource* CreateScratchTexture(ID3D12Device* device, DXGI_FORMAT fo
                                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&res));
     }
     if (FAILED(hr)) {
-        Log("[Proxy] Failed to allocate scratch texture %ux%u (hr=0x%08X)", width, height, hr);
+        HRESULT reason = device->GetDeviceRemovedReason();
+        static HRESULT s_lastLoggedHr = S_OK;
+        static ULONGLONG s_lastLogTime = 0;
+        ULONGLONG now = GetTickCount64();
+        if (hr != s_lastLoggedHr || (now - s_lastLogTime) > 3000) {
+            Log("[Proxy] Failed to allocate scratch texture %ux%u (hr=0x%08X, reason=0x%08X)", width, height, hr, reason);
+            s_lastLoggedHr = hr;
+            s_lastLogTime = now;
+        }
         return nullptr;
     }
     return res;
@@ -643,13 +705,36 @@ static int EvaluateFeatureInternal(
     CheckHotkeys();
     TickRetired();
 
-    // Pass through directly to real DLL when proxy is disabled
-    if (!g_enableProxy.load()) {
-        return real_Evaluate(InCmdList, InFeatureHandle, InParameters, InCallback);
+    static ID3D12GraphicsCommandList* s_lastCmdList = nullptr;
+    static LARGE_INTEGER s_qpcFreq = {};
+    static LARGE_INTEGER s_lastPassQpc = {};
+    static uint32_t s_passCountThisFrame = 0;
+    static ID3D12Resource* s_lastResolveOutput = nullptr;
+
+    if (s_qpcFreq.QuadPart == 0) {
+        QueryPerformanceFrequency(&s_qpcFreq);
+    }
+
+    LARGE_INTEGER nowQpc;
+    QueryPerformanceCounter(&nowQpc);
+
+    double deltaMs = 0.0;
+    if (s_lastPassQpc.QuadPart > 0) {
+        deltaMs = (double)(nowQpc.QuadPart - s_lastPassQpc.QuadPart) * 1000.0 / (double)s_qpcFreq.QuadPart;
+    }
+    s_lastPassQpc = nowQpc;
+
+    // Consecutive evaluate calls within the same frame execute on the CPU within < 2.0 ms.
+    // Inter-frame intervals (even at 240 FPS = 4.16 ms) are always >= 2.0 ms.
+    if (InCmdList == s_lastCmdList && deltaMs > 0.0 && deltaMs < 2.0) {
+        s_passCountThisFrame++;
+    } else {
+        s_passCountThisFrame = 0;
+        s_lastCmdList = InCmdList;
+        s_lastResolveOutput = nullptr;
     }
 
     NVSDK_NGX_Parameter* params = (NVSDK_NGX_Parameter*)InParameters;
-    float currentScale = g_scale.load();
 
     ID3D12Resource* origColor = nullptr;
     ID3D12Resource* origOutput = nullptr;
@@ -661,6 +746,11 @@ static int EvaluateFeatureInternal(
     }
 
     if (!origColor || !origOutput || !InCmdList) {
+        static bool s_loggedNoRes = false;
+        if (!s_loggedNoRes) {
+            Log("[Proxy] EvaluateInternal: Bailout (no res): origColor=%p, origOutput=%p, InCmdList=%p", origColor, origOutput, InCmdList);
+            s_loggedNoRes = true;
+        }
         return real_Evaluate(InCmdList, InFeatureHandle, InParameters, InCallback);
     }
 
@@ -671,22 +761,85 @@ static int EvaluateFeatureInternal(
         outDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
         colorDesc.Width == 0 || colorDesc.Height == 0)
     {
-        return real_Evaluate(InCmdList, InFeatureHandle, InParameters, InCallback);
-    }
-
-    ID3D12Device* device = nullptr;
-    InCmdList->GetDevice(IID_PPV_ARGS(&device));
-    if (!device) {
-        return real_Evaluate(InCmdList, InFeatureHandle, InParameters, InCallback);
-    }
-
-    if (!InitD3D12Pipeline(device)) {
-        device->Release();
+        static bool s_loggedDim = false;
+        if (!s_loggedDim) {
+            Log("[Proxy] EvaluateInternal: Bailout (bad dim): colorDim=%d (%llux%u), outDim=%d (%llux%u)",
+                colorDesc.Dimension, colorDesc.Width, colorDesc.Height,
+                outDesc.Dimension, outDesc.Width, outDesc.Height);
+            s_loggedDim = true;
+        }
         return real_Evaluate(InCmdList, InFeatureHandle, InParameters, InCallback);
     }
 
     uint32_t nativeW = (uint32_t)colorDesc.Width;
     uint32_t nativeH = colorDesc.Height;
+    float currentScale = g_scale.load();
+
+    // Pass through directly to real DLL when proxy is disabled OR scale is 100% native
+    if (!g_enableProxy.load() || currentScale >= 0.999f) {
+        if (params && nativeW > 0 && nativeH > 0) {
+            params->Set("DLSSNR.Color", origColor);
+            params->Set("DLSSNR.Output", origOutput);
+            params->Set("Color", origColor);
+            params->Set("Output", origOutput);
+
+            params->Set("DLSSNR.Width", nativeW);
+            params->Set("DLSSNR.Height", nativeH);
+            params->Set("Width", nativeW);
+            params->Set("Height", nativeH);
+
+            params->Set("InputWidth", nativeW);
+            params->Set("InputHeight", nativeH);
+            params->Set("OutWidth", nativeW);
+            params->Set("OutHeight", nativeH);
+            params->Set("DLSSNR.InputWidth", nativeW);
+            params->Set("DLSSNR.InputHeight", nativeH);
+            params->Set("DLSSNR.OutputWidth", nativeW);
+            params->Set("DLSSNR.OutputHeight", nativeH);
+
+            params->Set("DLSSNR.ColorSubrectBaseX", 0u);
+            params->Set("DLSSNR.ColorSubrectBaseY", 0u);
+            params->Set("DLSSNR.ColorSubrectWidth", nativeW);
+            params->Set("DLSSNR.ColorSubrectHeight", nativeH);
+
+            params->Set("DLSSNR.OutputSubrectBaseX", 0u);
+            params->Set("DLSSNR.OutputSubrectBaseY", 0u);
+            params->Set("DLSSNR.OutputSubrectWidth", nativeW);
+            params->Set("DLSSNR.OutputSubrectHeight", nativeH);
+
+            params->Set("DepthHighRes", 0u);
+        }
+        return real_Evaluate(InCmdList, InFeatureHandle, InParameters, InCallback);
+    }
+
+    static int s_evalLogCount = 0;
+    if (s_evalLogCount < 10) {
+        s_evalLogCount++;
+        Log("[Proxy] EvaluateInternal: scale=%.2f, params=%p, color=%p, output=%p, cmdList=%p",
+            currentScale, params, origColor, origOutput, InCmdList);
+    }
+
+    ID3D12Device* device = nullptr;
+    InCmdList->GetDevice(IID_PPV_ARGS(&device));
+    if (!device) {
+        static bool s_loggedDev = false;
+        if (!s_loggedDev) {
+            Log("[Proxy] EvaluateInternal: Bailout (GetDevice failed)");
+            s_loggedDev = true;
+        }
+        return real_Evaluate(InCmdList, InFeatureHandle, InParameters, InCallback);
+    }
+
+    if (!InitD3D12Pipeline(device)) {
+        static bool s_loggedPipe = false;
+        if (!s_loggedPipe) {
+            Log("[Proxy] EvaluateInternal: Bailout (InitD3D12Pipeline failed)");
+            s_loggedPipe = true;
+        }
+        device->Release();
+        return real_Evaluate(InCmdList, InFeatureHandle, InParameters, InCallback);
+    }
+
     uint32_t workW = (currentScale >= 0.999f) ? nativeW : (((uint32_t)roundf(nativeW * currentScale)) & ~1);
     uint32_t workH = (currentScale >= 0.999f) ? nativeH : (((uint32_t)roundf(nativeH * currentScale)) & ~1);
     if (workW < 64) workW = 64;
@@ -696,12 +849,15 @@ static int EvaluateFeatureInternal(
     DXGI_FORMAT typedOutFormat = ToNonTypeless(outDesc.Format);
     DXGI_FORMAT scratchFormat = GetUavSafeScratchFormat(typedColorFormat);
 
-    // Multi-Slot Lookup: Find slot matching this game handle, resolution, and color format
+    uint32_t currentPass = (s_passCountThisFrame < MAX_FEATURE_SLOTS) ? s_passCountThisFrame : (MAX_FEATURE_SLOTS - 1);
+
+    // Multi-Slot Lookup: Find slot matching this game handle, pass index, resolution, and color format
     FeatureSlot* slot = nullptr;
     if (InFeatureHandle) {
         for (size_t i = 0; i < MAX_FEATURE_SLOTS; ++i) {
             if (g_slots[i].inUse &&
                 g_slots[i].origGameHandle == InFeatureHandle &&
+                g_slots[i].passIndex == currentPass &&
                 g_slots[i].nativeW == nativeW &&
                 g_slots[i].nativeH == nativeH &&
                 g_slots[i].colorFormat == typedColorFormat)
@@ -714,6 +870,7 @@ static int EvaluateFeatureInternal(
     if (!slot) {
         for (size_t i = 0; i < MAX_FEATURE_SLOTS; ++i) {
             if (g_slots[i].inUse &&
+                g_slots[i].passIndex == currentPass &&
                 g_slots[i].nativeW == nativeW &&
                 g_slots[i].nativeH == nativeH &&
                 g_slots[i].colorFormat == typedColorFormat)
@@ -745,14 +902,15 @@ static int EvaluateFeatureInternal(
             ReleaseSlotResources(*slot);
         }
         slot->inUse = true;
+        slot->passIndex = currentPass;
         slot->origGameHandle = InFeatureHandle;
         slot->nativeW = nativeW;
         slot->nativeH = nativeH;
         slot->colorFormat = typedColorFormat;
         slot->scratchFormat = scratchFormat;
-        slot->scale = currentScale;
-        slot->workW = workW;
-        slot->workH = workH;
+        slot->scale = 0.0f;
+        slot->workW = 0;
+        slot->workH = 0;
     }
 
     slot->origGameHandle = InFeatureHandle;
@@ -770,22 +928,33 @@ static int EvaluateFeatureInternal(
 
     if (currentScale < 0.999f) {
         if (!slot->colorSmall || slot->workW != workW || slot->workH != workH) {
-            ReleaseSlotResources(*slot);
-            slot->colorSmall = CreateScratchTexture(device, scratchFormat, workW, workH);
-            slot->outputSmall = CreateScratchTexture(device, scratchFormat, workW, workH);
-            slot->nativeScratch = CreateScratchTexture(device, scratchFormat, nativeW, nativeH);
-            slot->workW = workW;
-            slot->workH = workH;
-            slot->scratchFormat = scratchFormat;
-            needRecreate = true;
-            Log("[Proxy] Allocated slot textures: work=%ux%u, native=%ux%u (Format=%d, ScratchFormat=%d, Scale=%.2f)",
-                workW, workH, nativeW, nativeH, typedColorFormat, scratchFormat, currentScale);
+            ULONGLONG now = GetTickCount64();
+            if (slot->lastAllocAttemptTick == 0 || (now - slot->lastAllocAttemptTick) > 2000) {
+                slot->lastAllocAttemptTick = now;
+                ReleaseSlotResources(*slot);
+                slot->colorSmall = CreateScratchTexture(device, scratchFormat, workW, workH);
+                slot->outputSmall = CreateScratchTexture(device, scratchFormat, workW, workH);
+                slot->nativeScratch = CreateScratchTexture(device, scratchFormat, nativeW, nativeH);
+                slot->workW = workW;
+                slot->workH = workH;
+                slot->scratchFormat = scratchFormat;
+                needRecreate = true;
+                if (slot->colorSmall && slot->outputSmall) {
+                    Log("[Proxy] Allocated slot %u textures: work=%ux%u, native=%ux%u (Format=%d, ScratchFormat=%d, Scale=%.2f)",
+                        currentPass, workW, workH, nativeW, nativeH, typedColorFormat, scratchFormat, currentScale);
+                }
+            }
         }
     } else {
         if (slot->colorSmall) {
             ReleaseSlotResources(*slot);
             needRecreate = true;
         }
+    }
+
+    if (!slot->colorSmall || !slot->outputSmall) {
+        device->Release();
+        return real_Evaluate(InCmdList, InFeatureHandle, InParameters, InCallback);
     }
 
     if (needRecreate) {
@@ -796,6 +965,7 @@ static int EvaluateFeatureInternal(
         uint32_t origWidth = 0, origHeight = 0, origOutW = 0, origOutH = 0;
         uint32_t origInW = 0, origInH = 0;
         uint32_t origDlssInW = 0, origDlssInH = 0, origDlssOutW = 0, origDlssOutH = 0;
+        uint32_t origResW = 0, origResH = 0, origResOutW = 0, origResOutH = 0;
         ID3D12Resource* origColorParam = nullptr;
         ID3D12Resource* origOutParam = nullptr;
         params->Get("Width", &origWidth);
@@ -808,6 +978,10 @@ static int EvaluateFeatureInternal(
         params->Get("DLSSNR.InputHeight", &origDlssInH);
         params->Get("DLSSNR.OutputWidth", &origDlssOutW);
         params->Get("DLSSNR.OutputHeight", &origDlssOutH);
+        params->Get("ResourceWidth", &origResW);
+        params->Get("ResourceHeight", &origResH);
+        params->Get("ResourceOutWidth", &origResOutW);
+        params->Get("ResourceOutHeight", &origResOutH);
         params->Get("Color", &origColorParam);
         params->Get("Output", &origOutParam);
 
@@ -832,6 +1006,44 @@ static int EvaluateFeatureInternal(
         params->Set("DLSSNR.OutputSubrectWidth", workW);
         params->Set("DLSSNR.OutputSubrectHeight", workH);
 
+        // Synchronize resource dimensions so _nvngx.dll does not assume native buffer stride (Issue #4)
+        if (origResW > 0) {
+            params->Set("ResourceWidth", workW);
+            params->Set("ResourceHeight", workH);
+            params->Set("ResourceOutWidth", workW);
+            params->Set("ResourceOutHeight", workH);
+        }
+
+        // Guide buffer subrect synchronization during feature creation
+        ID3D12Resource* depthResCreate = nullptr;
+        if (params->Get("DLSSNR.Depth", &depthResCreate) != 0 || !depthResCreate) {
+            params->Get("Depth", &depthResCreate);
+        }
+        if (depthResCreate) {
+            D3D12_RESOURCE_DESC dDesc = depthResCreate->GetDesc();
+            uint32_t dW = (uint32_t)dDesc.Width;
+            uint32_t dH = dDesc.Height;
+            params->Set("DLSSNR.DepthSubrectBaseX", 0u);
+            params->Set("DLSSNR.DepthSubrectBaseY", 0u);
+            params->Set("DLSSNR.DepthSubrectWidth", dW);
+            params->Set("DLSSNR.DepthSubrectHeight", dH);
+            params->Set("DepthHighRes", (dW > workW) ? 1 : 0);
+        }
+
+        ID3D12Resource* mvecResCreate = nullptr;
+        if (params->Get("DLSSNR.MotionVectors", &mvecResCreate) != 0 || !mvecResCreate) {
+            params->Get("MotionVectors", &mvecResCreate);
+        }
+        if (mvecResCreate) {
+            D3D12_RESOURCE_DESC mDesc = mvecResCreate->GetDesc();
+            uint32_t mW = (uint32_t)mDesc.Width;
+            uint32_t mH = mDesc.Height;
+            params->Set("DLSSNR.MVecSubrectBaseX", 0u);
+            params->Set("DLSSNR.MVecSubrectBaseY", 0u);
+            params->Set("DLSSNR.MVecSubrectWidth", mW);
+            params->Set("DLSSNR.MVecSubrectHeight", mH);
+        }
+
         if (currentScale < 0.999f) {
             params->Set("Color", slot->colorSmall);
             params->Set("Output", slot->outputSmall);
@@ -845,19 +1057,23 @@ static int EvaluateFeatureInternal(
         }
 
         int createRes = real_Create(InCmdList, 18, params, &slot->activeFeature);
-        Log("[Proxy] Created neural feature in slot (%ux%u -> native %ux%u, scale=%.2f): res=0x%X, handle=%p",
-            workW, workH, nativeW, nativeH, currentScale, createRes, slot->activeFeature);
+        Log("[Proxy] Created neural feature in slot %u (%ux%u -> native %ux%u, scale=%.2f): res=0x%X, handle=%p",
+            currentPass, workW, workH, nativeW, nativeH, currentScale, createRes, slot->activeFeature);
 
-        if (origWidth) params->Set("Width", origWidth);
-        if (origHeight) params->Set("Height", origHeight);
-        if (origOutW) params->Set("OutWidth", origOutW);
-        if (origOutH) params->Set("OutHeight", origOutH);
-        if (origInW) params->Set("InputWidth", origInW);
-        if (origInH) params->Set("InputHeight", origInH);
-        if (origDlssInW) params->Set("DLSSNR.InputWidth", origDlssInW);
-        if (origDlssInH) params->Set("DLSSNR.InputHeight", origDlssInH);
-        if (origDlssOutW) params->Set("DLSSNR.OutputWidth", origDlssOutW);
-        if (origDlssOutH) params->Set("DLSSNR.OutputHeight", origDlssOutH);
+        params->Set("Width", origWidth ? origWidth : nativeW);
+        params->Set("Height", origHeight ? origHeight : nativeH);
+        params->Set("OutWidth", origOutW ? origOutW : nativeW);
+        params->Set("OutHeight", origOutH ? origOutH : nativeH);
+        params->Set("InputWidth", origInW ? origInW : nativeW);
+        params->Set("InputHeight", origInH ? origInH : nativeH);
+        params->Set("DLSSNR.InputWidth", origDlssInW ? origDlssInW : nativeW);
+        params->Set("DLSSNR.InputHeight", origDlssInH ? origDlssInH : nativeH);
+        params->Set("DLSSNR.OutputWidth", origDlssOutW ? origDlssOutW : nativeW);
+        params->Set("DLSSNR.OutputHeight", origDlssOutH ? origDlssOutH : nativeH);
+        if (origResW) params->Set("ResourceWidth", origResW);
+        if (origResH) params->Set("ResourceHeight", origResH);
+        if (origResOutW) params->Set("ResourceOutWidth", origResOutW);
+        if (origResOutH) params->Set("ResourceOutHeight", origResOutH);
         if (origColorParam) params->Set("Color", origColorParam);
         if (origOutParam) params->Set("Output", origOutParam);
 
@@ -873,28 +1089,29 @@ static int EvaluateFeatureInternal(
         params->Set("DLSSNR.OutputSubrectBaseY", 0u);
         params->Set("DLSSNR.OutputSubrectWidth", nativeW);
         params->Set("DLSSNR.OutputSubrectHeight", nativeH);
+        params->Set("DepthHighRes", 0u);
 
         if (NVSDK_NGX_FAILED(createRes) || !slot->activeFeature) {
-            Log("[Proxy] real_Create failed (0x%X), falling back to native passthrough", createRes);
+            static ULONGLONG s_lastCreateFailTick = 0;
+            ULONGLONG now = GetTickCount64();
+            if (now - s_lastCreateFailTick > 2000) {
+                Log("[Proxy] real_Create failed (0x%X), falling back to native passthrough", createRes);
+                s_lastCreateFailTick = now;
+            }
             slot->activeFeature = nullptr;
-            slot->scale = 1.0f;
+            slot->scale = currentScale;
             device->Release();
             return real_Evaluate(InCmdList, InFeatureHandle, InParameters, InCallback);
         }
 
         slot->scale = currentScale;
+        slot->skipEvaluateFrames = 0;
     }
 
     device->Release();
 
-    if (currentScale >= 0.999f) {
-        const void* feat = (slot->activeFeature ? slot->activeFeature : InFeatureHandle);
-        return real_Evaluate(InCmdList, feat, InParameters, InCallback);
-    }
-
     if (!slot->colorSmall || !slot->outputSmall || !slot->activeFeature) {
-        const void* feat = (slot->activeFeature ? slot->activeFeature : InFeatureHandle);
-        return real_Evaluate(InCmdList, feat, InParameters, InCallback);
+        return real_Evaluate(InCmdList, InFeatureHandle, InParameters, InCallback);
     }
 
     // Save original parameters
@@ -942,6 +1159,15 @@ static int EvaluateFeatureInternal(
     params->Get("DLSSNR.MVecSubrectWidth", &origMvSubW);
     params->Get("DLSSNR.MVecSubrectHeight", &origMvSubH);
 
+    uint32_t origResW = 0, origResH = 0, origResOutW = 0, origResOutH = 0;
+    params->Get("ResourceWidth", &origResW);
+    params->Get("ResourceHeight", &origResH);
+    params->Get("ResourceOutWidth", &origResOutW);
+    params->Get("ResourceOutHeight", &origResOutH);
+
+    uint32_t origDepthHighRes = 0;
+    params->Get("DepthHighRes", &origDepthHighRes);
+
     // Query G-buffers if present (e.g. RenoDX Upscaled hook)
     ID3D12Resource* depthRes = nullptr;
     if (params->Get("DLSSNR.Depth", &depthRes) != 0 || !depthRes) {
@@ -984,42 +1210,50 @@ static int EvaluateFeatureInternal(
         params->Set("Color", origColor);
         params->Set("Output", origOutput);
 
-        params->Set("DLSSNR.Width", origW);
-        params->Set("DLSSNR.Height", origH);
-        params->Set("Width", origW);
-        params->Set("Height", origH);
+        params->Set("DLSSNR.Width", origW ? origW : nativeW);
+        params->Set("DLSSNR.Height", origH ? origH : nativeH);
+        params->Set("Width", origW ? origW : nativeW);
+        params->Set("Height", origH ? origH : nativeH);
 
-        if (origInW) params->Set("InputWidth", origInW);
-        if (origInH) params->Set("InputHeight", origInH);
-        if (origOutW) params->Set("OutWidth", origOutW);
-        if (origOutH) params->Set("OutHeight", origOutH);
-        if (origDlssInW) params->Set("DLSSNR.InputWidth", origDlssInW);
-        if (origDlssInH) params->Set("DLSSNR.InputHeight", origDlssInH);
-        if (origDlssOutW) params->Set("DLSSNR.OutputWidth", origDlssOutW);
-        if (origDlssOutH) params->Set("DLSSNR.OutputHeight", origDlssOutH);
+        params->Set("InputWidth", origInW ? origInW : nativeW);
+        params->Set("InputHeight", origInH ? origInH : nativeH);
+        params->Set("OutWidth", origOutW ? origOutW : nativeW);
+        params->Set("OutHeight", origOutH ? origOutH : nativeH);
+        params->Set("DLSSNR.InputWidth", origDlssInW ? origDlssInW : nativeW);
+        params->Set("DLSSNR.InputHeight", origDlssInH ? origDlssInH : nativeH);
+        params->Set("DLSSNR.OutputWidth", origDlssOutW ? origDlssOutW : nativeW);
+        params->Set("DLSSNR.OutputHeight", origDlssOutH ? origDlssOutH : nativeH);
+
+        if (origResW > 0) {
+            params->Set("ResourceWidth", origResW);
+            params->Set("ResourceHeight", origResH);
+            params->Set("ResourceOutWidth", origResOutW);
+            params->Set("ResourceOutHeight", origResOutH);
+        }
 
         params->Set("DLSSNR.ColorSubrectBaseX", origColorBaseX);
         params->Set("DLSSNR.ColorSubrectBaseY", origColorBaseY);
-        params->Set("DLSSNR.ColorSubrectWidth", origColorSubW);
-        params->Set("DLSSNR.ColorSubrectHeight", origColorSubH);
+        params->Set("DLSSNR.ColorSubrectWidth", origColorSubW ? origColorSubW : nativeW);
+        params->Set("DLSSNR.ColorSubrectHeight", origColorSubH ? origColorSubH : nativeH);
 
         params->Set("DLSSNR.OutputSubrectBaseX", origOutBaseX);
         params->Set("DLSSNR.OutputSubrectBaseY", origOutBaseY);
-        params->Set("DLSSNR.OutputSubrectWidth", origOutSubW);
-        params->Set("DLSSNR.OutputSubrectHeight", origOutSubH);
+        params->Set("DLSSNR.OutputSubrectWidth", origOutSubW ? origOutSubW : nativeW);
+        params->Set("DLSSNR.OutputSubrectHeight", origOutSubH ? origOutSubH : nativeH);
 
         if (depthRes) {
             params->Set("DLSSNR.DepthSubrectBaseX", origDepthBaseX);
             params->Set("DLSSNR.DepthSubrectBaseY", origDepthBaseY);
-            params->Set("DLSSNR.DepthSubrectWidth", origDepthSubW);
-            params->Set("DLSSNR.DepthSubrectHeight", origDepthSubH);
+            params->Set("DLSSNR.DepthSubrectWidth", actualDepthW);
+            params->Set("DLSSNR.DepthSubrectHeight", actualDepthH);
+            params->Set("DepthHighRes", origDepthHighRes);
         }
 
         if (mvecRes) {
             params->Set("DLSSNR.MVecSubrectBaseX", origMvBaseX);
             params->Set("DLSSNR.MVecSubrectBaseY", origMvBaseY);
-            params->Set("DLSSNR.MVecSubrectWidth", origMvSubW);
-            params->Set("DLSSNR.MVecSubrectHeight", origMvSubH);
+            params->Set("DLSSNR.MVecSubrectWidth", actualMvW);
+            params->Set("DLSSNR.MVecSubrectHeight", actualMvH);
         }
 
         params->Set("DLSSNR.MVecScaleX", origMvX);
@@ -1027,6 +1261,14 @@ static int EvaluateFeatureInternal(
         params->Set("MVecScaleX", origMvX);
         params->Set("MVecScaleY", origMvY);
     };
+
+    // Multi-pass transition barrier:
+    // If this is a subsequent pass on the same command list and origColor was written
+    // as a UAV output in the immediately preceding pass, transition it from UAV to SRV.
+    bool origColorWasUavOutput = (s_passCountThisFrame > 0 && s_lastResolveOutput && origColor == s_lastResolveOutput);
+    if (origColorWasUavOutput) {
+        TransitionBarrier(InCmdList, origColor, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
 
     // Pass 1: Downsample native color to scratch input
     TransitionBarrier(InCmdList, slot->colorSmall, slot->colorSmallState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1090,6 +1332,14 @@ static int EvaluateFeatureInternal(
     params->Set("DLSSNR.OutputWidth", workW);
     params->Set("DLSSNR.OutputHeight", workH);
 
+    // Synchronize resource dimensions for evaluate (Issue #4) only if set by caller
+    if (origResW > 0) {
+        params->Set("ResourceWidth", workW);
+        params->Set("ResourceHeight", workH);
+        params->Set("ResourceOutWidth", workW);
+        params->Set("ResourceOutHeight", workH);
+    }
+
     params->Set("DLSSNR.ColorSubrectBaseX", 0u);
     params->Set("DLSSNR.ColorSubrectBaseY", 0u);
     params->Set("DLSSNR.ColorSubrectWidth", workW);
@@ -1105,6 +1355,7 @@ static int EvaluateFeatureInternal(
         params->Set("DLSSNR.DepthSubrectBaseY", origDepthBaseY);
         params->Set("DLSSNR.DepthSubrectWidth", actualDepthW);
         params->Set("DLSSNR.DepthSubrectHeight", actualDepthH);
+        params->Set("DepthHighRes", (actualDepthW > workW) ? 1 : 0);
     }
 
     if (mvecRes && actualMvW > 0 && actualMvH > 0) {
@@ -1148,7 +1399,7 @@ static int EvaluateFeatureInternal(
 
         TransitionBarrier(InCmdList, slot->nativeScratch, slot->nativeScratchState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         slot->nativeScratchState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        TransitionBarrier(InCmdList, origColor, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        TransitionBarrier(InCmdList, origColor, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
         resolveReadSource = slot->nativeScratch;
         resolveReadFormat = scratchFormat;
@@ -1185,10 +1436,15 @@ static int EvaluateFeatureInternal(
     resConstants.nativeHeight = nativeH;
     resConstants.workWidth = workW;
     resConstants.workHeight = workH;
+    // Multi-pass protection:
+    // If this pass is writing to the same buffer in a multi-pass pipeline,
+    // disable RCAS to prevent exponential edge ringing / shimmer.
+    // Transfer strength is preserved full-power (never halved) to prevent multi-pass flickering.
+    bool isSameBufferMultiPass = (s_passCountThisFrame > 0 && s_lastResolveOutput && origColor == s_lastResolveOutput);
     resConstants.transferStrength = g_transferStrength.load();
-    resConstants.sharpness = g_sharpness.load();
+    resConstants.sharpness = isSameBufferMultiPass ? 0.0f : g_sharpness.load();
     resConstants.enlargementMode = g_enlargementMode.load();
-    resConstants.pad0 = 0;
+    resConstants.colorStrength = g_colorStrength.load();
 
     InCmdList->SetComputeRoot32BitConstants(0, 8, &resConstants, 0);
     InCmdList->SetComputeRootDescriptorTable(1, gpuHandleResolve);
@@ -1199,6 +1455,8 @@ static int EvaluateFeatureInternal(
     uavFlush.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     uavFlush.UAV.pResource = resolveWriteDest;
     InCmdList->ResourceBarrier(1, &uavFlush);
+
+    s_lastResolveOutput = resolveWriteDest;
 
     if (!outHasUav && slot->nativeScratch && resolveWriteDest == slot->nativeScratch && outDesc.Format == slot->nativeScratch->GetDesc().Format) {
         TransitionBarrier(InCmdList, slot->nativeScratch, slot->nativeScratchState, D3D12_RESOURCE_STATE_COPY_SOURCE);
