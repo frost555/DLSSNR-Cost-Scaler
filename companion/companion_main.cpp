@@ -1,4 +1,4 @@
-﻿#define WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <cstdio>
 #include <cwchar>
@@ -352,7 +352,6 @@ static void DrawOverlay(reshade::api::effect_runtime* /*runtime*/) {
         if (ImGui::SliderFloat("Resolution Scale", &s_resolutionScale, 0.25f, 1.00f, "%.2f")) {
             s_dirty = true;
             s_lastChangeTick = GetTickCount64();
-            PushToSharedMemory(1);
         }
         if (ImGui::IsItemDeactivatedAfterEdit()) {
             s_dirty = true;
@@ -471,13 +470,14 @@ static void DrawOverlay(reshade::api::effect_runtime* /*runtime*/) {
 
     ULONGLONG now = GetTickCount64();
     if (s_dirty) {
-        if (s_lastChangeTick == 0 || (now - s_lastChangeTick >= DEBOUNCE_DELAY_MS)) {
+        if (s_lastChangeTick == 0 || (now - s_lastChangeTick >= 350)) {
+            PushToSharedMemory(1);
             SaveIniSettings();
             s_dirty = false;
             snprintf(s_statusMsg, sizeof(s_statusMsg), "Saved to nvngx_dlssnr.ini (Scale=%.2f, Sharp=%.2f)", s_resolutionScale, s_sharpness);
             s_statusMsgTick = now;
         } else {
-            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "%s", "Live updating (syncing to INI)...");
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "%s", "Release slider to apply resolution...");
         }
     }
 

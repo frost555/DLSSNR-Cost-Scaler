@@ -462,7 +462,7 @@ static std::recursive_mutex g_proxyMutex;
 struct NrRetired {
     void* feature = nullptr;
     ID3D12Resource* resource = nullptr;
-    int framesLeft = 16;
+    int framesLeft = 4;
 };
 static std::vector<NrRetired> g_retiredList;
 
@@ -470,28 +470,33 @@ static void ParkNrFeature(void*& feature) {
     if (!feature) return;
     NrRetired r;
     r.feature = feature;
+    r.framesLeft = 4;
     feature = nullptr;
     g_retiredList.push_back(r);
+}
+
+static void ReleaseSlotScratch(FeatureSlot& slot) {
+    if (slot.colorSmall) {
+        NrRetired r; r.resource = slot.colorSmall; r.framesLeft = 4; g_retiredList.push_back(r);
+        slot.colorSmall = nullptr;
+    }
+    if (slot.outputSmall) {
+        NrRetired r; r.resource = slot.outputSmall; r.framesLeft = 4; g_retiredList.push_back(r);
+        slot.outputSmall = nullptr;
+    }
+    slot.colorSmallState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    slot.outputSmallState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 }
 
 static void ReleaseSlotResources(FeatureSlot& slot) {
     if (slot.activeFeature) {
         ParkNrFeature(slot.activeFeature);
     }
-    if (slot.colorSmall) {
-        NrRetired r; r.resource = slot.colorSmall; g_retiredList.push_back(r);
-        slot.colorSmall = nullptr;
-    }
-    if (slot.outputSmall) {
-        NrRetired r; r.resource = slot.outputSmall; g_retiredList.push_back(r);
-        slot.outputSmall = nullptr;
-    }
+    ReleaseSlotScratch(slot);
     if (slot.nativeScratch) {
-        NrRetired r; r.resource = slot.nativeScratch; g_retiredList.push_back(r);
+        NrRetired r; r.resource = slot.nativeScratch; r.framesLeft = 4; g_retiredList.push_back(r);
         slot.nativeScratch = nullptr;
     }
-    slot.colorSmallState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    slot.outputSmallState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     slot.nativeScratchState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 }
 
@@ -501,13 +506,33 @@ static void TickRetired() {
             ++i;
             continue;
         }
-        if (g_retiredList[i].feature && real_Release) {
-            real_Release(g_retiredList[i].feature);
+        if (g_retiredList[i].feature) {
+            if (real_Release) {
+                int res = real_Release(g_retiredList[i].feature);
+                Log("[Proxy] Retired DLSS-NR feature %p released (res=0x%X)", g_retiredList[i].feature, res);
+            }
         }
         if (g_retiredList[i].resource) {
             g_retiredList[i].resource->Release();
         }
         g_retiredList.erase(g_retiredList.begin() + i);
+    }
+
+    // Safety cap: If retired list exceeds 8 items, force release items with framesLeft <= 2
+    if (g_retiredList.size() > 8) {
+        for (size_t i = 0; i < g_retiredList.size();) {
+            if (g_retiredList[i].framesLeft <= 2) {
+                if (g_retiredList[i].feature && real_Release) {
+                    real_Release(g_retiredList[i].feature);
+                }
+                if (g_retiredList[i].resource) {
+                    g_retiredList[i].resource->Release();
+                }
+                g_retiredList.erase(g_retiredList.begin() + i);
+            } else {
+                ++i;
+            }
+        }
     }
 }
 
@@ -846,6 +871,12 @@ static int EvaluateFeatureInternal(
 
     // Pass through directly to real DLL when proxy is disabled OR scale is 100% native
     if (!g_enableProxy.load() || currentScale >= 0.999f) {
+        for (size_t i = 0; i < MAX_FEATURE_SLOTS; ++i) {
+            if (g_slots[i].inUse && (g_slots[i].colorSmall || g_slots[i].activeFeature)) {
+                ReleaseSlotResources(g_slots[i]);
+                g_slots[i].scale = 1.0f;
+            }
+        }
         if (params && nativeW > 0 && nativeH > 0) {
             params->Set("DLSSNR.Color", origColor);
             params->Set("DLSSNR.Output", origOutput);
@@ -1001,10 +1032,16 @@ static int EvaluateFeatureInternal(
             if (slot->allocFailed && (now - slot->lastAllocAttemptTick < 2000)) {
                 // Wait during backoff after previous allocation failure
             } else {
-                ReleaseSlotResources(*slot);
+                ReleaseSlotScratch(*slot);
+                if (!slot->nativeScratch || slot->nativeW != nativeW || slot->nativeH != nativeH) {
+                    if (slot->nativeScratch) {
+                        NrRetired r; r.resource = slot->nativeScratch; r.framesLeft = 4; g_retiredList.push_back(r);
+                        slot->nativeScratch = nullptr;
+                    }
+                    slot->nativeScratch = CreateScratchTexture(device, scratchFormat, nativeW, nativeH);
+                }
                 slot->colorSmall = CreateScratchTexture(device, scratchFormat, workW, workH);
                 slot->outputSmall = CreateScratchTexture(device, scratchFormat, workW, workH);
-                slot->nativeScratch = CreateScratchTexture(device, scratchFormat, nativeW, nativeH);
                 if (!slot->colorSmall || !slot->outputSmall) {
                     slot->allocFailed = true;
                     slot->lastAllocAttemptTick = now;
