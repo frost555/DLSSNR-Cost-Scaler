@@ -130,38 +130,65 @@ void CS_Resolve(uint3 id : SV_DispatchThreadID)
         return;
     }
 
-    // Mode 1: Luminance-Preserving Neural Transfer (does not re-inject raw Monte Carlo noise)
+    // Mode 1: Matched Residual (1:1 Native Resolution Anchor + Scaled Neural Delta)
+    // 1. Pristine 1:1 Native Game Pixel (preserves all geometry, subpixel edges, textures, text)
     float4 nativeSample = gNativeColor.Load(int3(id.xy, 0));
     float3 original = nativeSample.rgb;
 
+    // 2. Sample neural input and output
     float3 smallInput = gSmallInput.SampleLevel(gLinear, uv, 0).rgb;
     float3 smallOutput = gSmallOutput.SampleLevel(gLinear, uv, 0).rgb;
 
+    // 3. Compute neural delta / edit
+    float3 edit = smallOutput - smallInput;
+
+    // Chroma vs Luma control for ColorStrength
+    float editLuma = dot(edit, kLuma);
+    float3 editChroma = edit - editLuma;
+    float3 controlledEdit = editLuma + editChroma * saturate(gColorStrength);
+
+    // Apply TransferStrength
+    float3 scaledEdit = controlledEdit * gTransferStrength;
+
+    // Base native frame + scaled neural delta
+    float3 result = max(original + scaledEdit, 0.0);
+
+    // 4. HDR highlight & shadow guard using luminance ratio
     float origLuma = dot(max(original, 0.0), kLuma);
-    float inLuma = dot(max(smallInput, 0.0), kLuma);
-    float outLuma = dot(max(smallOutput, 0.0), kLuma);
+    float inLuma   = dot(max(smallInput, 0.0), kLuma);
+    float outLuma  = dot(max(smallOutput, 0.0), kLuma);
 
     const float kFloor = 1.0 / 512.0;
     float lumaRatio = (outLuma + kFloor) / (inLuma + kFloor);
 
-    float3 lumaScaled = original * lumaRatio;
-    float3 result = lerp(lumaScaled, smallOutput, saturate(gColorStrength));
-    result = lerp(original, result, saturate(gTransferStrength));
-    result = max(result, 0.0);
+    float resLuma = dot(result, kLuma);
+    if (resLuma > 1e-5 && inLuma > 1e-5)
+    {
+        float targetLuma = origLuma * lumaRatio;
+        float maxAllowedLuma = max(origLuma * 2.5, targetLuma * 1.5 + 0.1);
+        if (resLuma > maxAllowedLuma)
+        {
+            result *= (maxAllowedLuma / resLuma);
+        }
+    }
 
+    // 5. RCAS (Robust Contrast-Adaptive Sharpening) directly on the native pixel grid
     if (gSharpness > 0.001)
     {
-        float2 px = float2(1.0 / (float)gNativeWidth, 1.0 / (float)gNativeHeight);
-        float3 cE = gSmallOutput.SampleLevel(gLinear, uv + float2( px.x, 0), 0).rgb;
-        float3 cW = gSmallOutput.SampleLevel(gLinear, uv + float2(-px.x, 0), 0).rgb;
-        float3 cS = gSmallOutput.SampleLevel(gLinear, uv + float2(0,  px.y), 0).rgb;
-        float3 cN = gSmallOutput.SampleLevel(gLinear, uv + float2(0, -px.y), 0).rgb;
+        int2 coord = int2(id.xy);
+        int w = (int)gNativeWidth - 1;
+        int h = (int)gNativeHeight - 1;
+
+        float3 cE = gNativeColor.Load(int3(min(coord.x + 1, w), coord.y, 0)).rgb;
+        float3 cW = gNativeColor.Load(int3(max(coord.x - 1, 0), coord.y, 0)).rgb;
+        float3 cS = gNativeColor.Load(int3(coord.x, min(coord.y + 1, h), 0)).rgb;
+        float3 cN = gNativeColor.Load(int3(coord.x, max(coord.y - 1, 0), 0)).rgb;
 
         float lE = dot(cE, kLuma);
         float lW = dot(cW, kLuma);
         float lS = dot(cS, kLuma);
         float lN = dot(cN, kLuma);
-        float lM = dot(result, kLuma);
+        float lM = origLuma;
 
         float minL = min(lM, min(min(lE, lW), min(lS, lN)));
         float maxL = max(lM, max(max(lE, lW), max(lS, lN)));
@@ -170,7 +197,7 @@ void CS_Resolve(uint3 id : SV_DispatchThreadID)
         if (range > 1e-5)
         {
             float3 crossAvg = (cE + cW + cS + cN) * 0.25;
-            float3 highFreq = result - crossAvg;
+            float3 highFreq = original - crossAvg;
             float adaptiveScale = saturate(1.0 - range / (maxL + 1e-4));
             float rcasWeight = saturate(gSharpness) * (0.2 + 0.8 * adaptiveScale);
             result = max(result + highFreq * rcasWeight, 0.0);

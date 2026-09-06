@@ -15,6 +15,7 @@
 
 #include "Downsample_Shader.h"
 #include "Resolve_Shader.h"
+#include "dlssnr_shared.h"
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -73,9 +74,22 @@ static int                   g_keyScaleDown   = VK_NEXT;
 static wchar_t               g_iniPath[MAX_PATH] = { 0 };
 static FILETIME              g_lastIniWriteTime = { 0 };
 
+static HANDLE              g_hProxySharedMem = nullptr;
+static DlssnrSharedConfig* g_proxySharedConfig = nullptr;
+static uint32_t            s_lastProxySharedVersion = 0;
+
+static void InitProxySharedMemory() {
+    if (g_proxySharedConfig) return;
+    g_hProxySharedMem = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(DlssnrSharedConfig), DLSSNR_SHARED_MEM_NAME);
+    if (g_hProxySharedMem) {
+        g_proxySharedConfig = (DlssnrSharedConfig*)MapViewOfFile(g_hProxySharedMem, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(DlssnrSharedConfig));
+    }
+}
+
 static void SaveConfigValue(const wchar_t* key, const wchar_t* value) {
     if (g_iniPath[0] == L'\0') return;
     WritePrivateProfileStringW(L"DLSSNR_Proxy", key, value, g_iniPath);
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, g_iniPath);
     WIN32_FILE_ATTRIBUTE_DATA fileInfo;
     if (GetFileAttributesExW(g_iniPath, GetFileExInfoStandard, &fileInfo)) {
         g_lastIniWriteTime = fileInfo.ftLastWriteTime;
@@ -84,10 +98,19 @@ static void SaveConfigValue(const wchar_t* key, const wchar_t* value) {
 
 static void LoadConfig() {
     if (g_iniPath[0] == L'\0') {
-        GetCurrentModulePath(g_iniPath, MAX_PATH);
-        wchar_t* lastSlash = wcsrchr(g_iniPath, L'\\');
+        wchar_t exePath[MAX_PATH] = { 0 };
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        wchar_t* lastSlash = wcsrchr(exePath, L'\\');
         if (lastSlash) *(lastSlash + 1) = L'\0';
-        wcscat_s(g_iniPath, L"nvngx_dlssnr.ini");
+        wcscat_s(exePath, L"nvngx_dlssnr.ini");
+        if (GetFileAttributesW(exePath) != INVALID_FILE_ATTRIBUTES) {
+            wcscpy_s(g_iniPath, exePath);
+        } else {
+            GetCurrentModulePath(g_iniPath, MAX_PATH);
+            wchar_t* lastSlash2 = wcsrchr(g_iniPath, L'\\');
+            if (lastSlash2) *(lastSlash2 + 1) = L'\0';
+            wcscat_s(g_iniPath, L"nvngx_dlssnr.ini");
+        }
     }
 
     WIN32_FILE_ATTRIBUTE_DATA fileInfo;
@@ -138,10 +161,51 @@ static void LoadConfig() {
         g_enableProxy.load() ? 1 : 0, val, g_enlargementMode.load(), g_transferStrength.load(), g_sharpness.load(), g_colorStrength.load(), g_enableHotkeys ? 1 : 0);
 }
 
+static void PushProxyToSharedMemory() {
+    if (!g_proxySharedConfig || g_proxySharedConfig->magic != DLSSNR_MAGIC) return;
+    g_proxySharedConfig->enableProxy = g_enableProxy.load() ? 1 : 0;
+    g_proxySharedConfig->resolutionScale = g_scale.load();
+    g_proxySharedConfig->enlargementMode = g_enlargementMode.load();
+    g_proxySharedConfig->transferStrength = g_transferStrength.load();
+    g_proxySharedConfig->colorStrength = g_colorStrength.load();
+    g_proxySharedConfig->sharpness = g_sharpness.load();
+    g_proxySharedConfig->enableHotkeys = g_enableHotkeys ? 1 : 0;
+    g_proxySharedConfig->requireCtrlAlt = g_requireCtrlAlt ? 1 : 0;
+    g_proxySharedConfig->keyToggleProxy = g_keyToggleProxy;
+    g_proxySharedConfig->keyToggleMode = g_keyToggleMode;
+    g_proxySharedConfig->keyScaleUp = g_keyScaleUp;
+    g_proxySharedConfig->keyScaleDown = g_keyScaleDown;
+    g_proxySharedConfig->writerSource = 2; // Proxy/Hotkey
+    g_proxySharedConfig->version++;
+    s_lastProxySharedVersion = g_proxySharedConfig->version;
+}
+
 static void CheckConfigHotReload() {
+    InitProxySharedMemory();
+
+    if (g_proxySharedConfig && g_proxySharedConfig->magic == DLSSNR_MAGIC) {
+        if (g_proxySharedConfig->version != s_lastProxySharedVersion) {
+            if (g_proxySharedConfig->writerSource != 2) {
+                g_enableProxy.store(g_proxySharedConfig->enableProxy != 0);
+                g_scale.store(g_proxySharedConfig->resolutionScale);
+                g_enlargementMode.store(g_proxySharedConfig->enlargementMode);
+                g_transferStrength.store(g_proxySharedConfig->transferStrength);
+                g_colorStrength.store(g_proxySharedConfig->colorStrength);
+                g_sharpness.store(g_proxySharedConfig->sharpness);
+                g_enableHotkeys = (g_proxySharedConfig->enableHotkeys != 0);
+                g_requireCtrlAlt = (g_proxySharedConfig->requireCtrlAlt != 0);
+                g_keyToggleProxy = g_proxySharedConfig->keyToggleProxy;
+                g_keyToggleMode  = g_proxySharedConfig->keyToggleMode;
+                g_keyScaleUp     = g_proxySharedConfig->keyScaleUp;
+                g_keyScaleDown   = g_proxySharedConfig->keyScaleDown;
+            }
+            s_lastProxySharedVersion = g_proxySharedConfig->version;
+        }
+    }
+
     static ULONGLONG s_lastCheck = 0;
     ULONGLONG now = GetTickCount64();
-    if (now - s_lastCheck < 1000) return;
+    if (now - s_lastCheck < 100) return;
     s_lastCheck = now;
 
     WIN32_FILE_ATTRIBUTE_DATA fileInfo;
@@ -174,6 +238,7 @@ static void CheckHotkeys() {
             wchar_t buf[16];
             swprintf_s(buf, L"%d", newState ? 1 : 0);
             SaveConfigValue(L"EnableProxy", buf);
+            PushProxyToSharedMemory();
             Log("[Proxy] Hotkey ToggleProxy: Proxy is now %s (synced to INI)", newState ? "ENABLED" : "DISABLED (Native Passthrough)");
             s_lastPress = now;
         }
@@ -183,6 +248,7 @@ static void CheckHotkeys() {
             wchar_t buf[16];
             swprintf_s(buf, L"%u", newMode);
             SaveConfigValue(L"EnlargementMode", buf);
+            PushProxyToSharedMemory();
             Log("[Proxy] Hotkey ToggleMode: EnlargementMode changed to %s (synced to INI)", newMode == 1 ? "Matched Residual" : "Classic Bilinear");
             s_lastPress = now;
         }
@@ -194,6 +260,7 @@ static void CheckHotkeys() {
                 wchar_t buf[16];
                 swprintf_s(buf, L"%.2f", next);
                 SaveConfigValue(L"ResolutionScale", buf);
+                PushProxyToSharedMemory();
                 Log("[Proxy] Hotkey ScaleUp: Scale changed from %.2f to %.2f (synced to INI)", current, next);
                 s_lastPress = now;
             }
@@ -206,6 +273,7 @@ static void CheckHotkeys() {
                 wchar_t buf[16];
                 swprintf_s(buf, L"%.2f", next);
                 SaveConfigValue(L"ResolutionScale", buf);
+                PushProxyToSharedMemory();
                 Log("[Proxy] Hotkey ScaleDown: Scale changed from %.2f to %.2f (synced to INI)", current, next);
                 s_lastPress = now;
             }
@@ -383,6 +451,7 @@ struct FeatureSlot {
     ULONGLONG           lastUsedTick = 0;
     ULONGLONG           lastAllocAttemptTick = 0;
     ULONGLONG           lastCreateAttemptTick = 0;
+    bool                allocFailed = false;
 };
 
 static constexpr size_t MAX_FEATURE_SLOTS = 4;
@@ -929,17 +998,24 @@ static int EvaluateFeatureInternal(
     if (currentScale < 0.999f) {
         if (!slot->colorSmall || slot->workW != workW || slot->workH != workH) {
             ULONGLONG now = GetTickCount64();
-            if (slot->lastAllocAttemptTick == 0 || (now - slot->lastAllocAttemptTick) > 2000) {
-                slot->lastAllocAttemptTick = now;
+            if (slot->allocFailed && (now - slot->lastAllocAttemptTick < 2000)) {
+                // Wait during backoff after previous allocation failure
+            } else {
                 ReleaseSlotResources(*slot);
                 slot->colorSmall = CreateScratchTexture(device, scratchFormat, workW, workH);
                 slot->outputSmall = CreateScratchTexture(device, scratchFormat, workW, workH);
                 slot->nativeScratch = CreateScratchTexture(device, scratchFormat, nativeW, nativeH);
-                slot->workW = workW;
-                slot->workH = workH;
-                slot->scratchFormat = scratchFormat;
-                needRecreate = true;
-                if (slot->colorSmall && slot->outputSmall) {
+                if (!slot->colorSmall || !slot->outputSmall) {
+                    slot->allocFailed = true;
+                    slot->lastAllocAttemptTick = now;
+                    Log("[Proxy] Scratch texture allocation failed for %ux%u, backing off for 2s", workW, workH);
+                } else {
+                    slot->allocFailed = false;
+                    slot->lastAllocAttemptTick = 0;
+                    slot->workW = workW;
+                    slot->workH = workH;
+                    slot->scratchFormat = scratchFormat;
+                    needRecreate = true;
                     Log("[Proxy] Allocated slot %u textures: work=%ux%u, native=%ux%u (Format=%d, ScratchFormat=%d, Scale=%.2f)",
                         currentPass, workW, workH, nativeW, nativeH, typedColorFormat, scratchFormat, currentScale);
                 }

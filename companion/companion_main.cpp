@@ -1,4 +1,4 @@
-#define WIN32_LEAN_AND_MEAN
+﻿#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <cstdio>
 #include <cwchar>
@@ -9,6 +9,7 @@
 #define ImTextureID ImU64
 #include "imgui.h"
 #include "reshade.hpp"
+#include "dlssnr_shared.h"
 
 extern "C" __declspec(dllexport) const char* NAME = "DLSS-NR Cost Scaler";
 extern "C" __declspec(dllexport) const char* DESCRIPTION = "Live configuration overlay for the DLSSNR-Cost-Scaler proxy.";
@@ -87,12 +88,99 @@ static char      s_statusMsg[128] = "Synced with nvngx_dlssnr.ini";
 static ULONGLONG s_statusMsgTick  = 0;
 static FILETIME  s_lastDiskWriteTime = { 0, 0 };
 
+// Inter-process Shared Memory State
+static HANDLE              g_hSharedMem = nullptr;
+static DlssnrSharedConfig* g_sharedConfig = nullptr;
+static uint32_t            s_lastCompanionVersion = 0;
+
 static std::wstring GetIniFilePath() {
     wchar_t exePath[MAX_PATH] = { 0 };
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
     wchar_t* lastSlash = wcsrchr(exePath, L'\\');
     if (lastSlash) *(lastSlash + 1) = L'\0';
     return std::wstring(exePath) + L"nvngx_dlssnr.ini";
+}
+
+static void InitSharedMemory() {
+    if (g_sharedConfig) return;
+    g_hSharedMem = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(DlssnrSharedConfig), DLSSNR_SHARED_MEM_NAME);
+    if (g_hSharedMem) {
+        g_sharedConfig = (DlssnrSharedConfig*)MapViewOfFile(g_hSharedMem, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(DlssnrSharedConfig));
+        if (g_sharedConfig) {
+            if (GetLastError() != ERROR_ALREADY_EXISTS) {
+                ZeroMemory(g_sharedConfig, sizeof(DlssnrSharedConfig));
+                g_sharedConfig->magic = DLSSNR_MAGIC;
+                g_sharedConfig->version = 1;
+                g_sharedConfig->enableProxy = s_enableProxy ? 1 : 0;
+                g_sharedConfig->resolutionScale = s_resolutionScale;
+                g_sharedConfig->enlargementMode = s_enlargementMode;
+                g_sharedConfig->transferStrength = s_transferStrength;
+                g_sharedConfig->colorStrength = s_colorStrength;
+                g_sharedConfig->sharpness = s_sharpness;
+                g_sharedConfig->enableHotkeys = s_enableHotkeys ? 1 : 0;
+                g_sharedConfig->requireCtrlAlt = s_requireCtrlAlt ? 1 : 0;
+                g_sharedConfig->keyToggleProxy = s_keyToggleProxy;
+                g_sharedConfig->keyToggleMode = s_keyToggleMode;
+                g_sharedConfig->keyScaleUp = s_keyScaleUp;
+                g_sharedConfig->keyScaleDown = s_keyScaleDown;
+                g_sharedConfig->writerSource = 1;
+                s_lastCompanionVersion = 1;
+            } else {
+                s_lastCompanionVersion = g_sharedConfig->version;
+            }
+        }
+    }
+}
+
+static void ShutdownSharedMemory() {
+    if (g_sharedConfig) {
+        UnmapViewOfFile(g_sharedConfig);
+        g_sharedConfig = nullptr;
+    }
+    if (g_hSharedMem) {
+        CloseHandle(g_hSharedMem);
+        g_hSharedMem = nullptr;
+    }
+}
+
+static void PushToSharedMemory(uint32_t source) {
+    if (!g_sharedConfig || g_sharedConfig->magic != DLSSNR_MAGIC) return;
+    g_sharedConfig->enableProxy = s_enableProxy ? 1 : 0;
+    g_sharedConfig->resolutionScale = s_resolutionScale;
+    g_sharedConfig->enlargementMode = s_enlargementMode;
+    g_sharedConfig->transferStrength = s_transferStrength;
+    g_sharedConfig->colorStrength = s_colorStrength;
+    g_sharedConfig->sharpness = s_sharpness;
+    g_sharedConfig->enableHotkeys = s_enableHotkeys ? 1 : 0;
+    g_sharedConfig->requireCtrlAlt = s_requireCtrlAlt ? 1 : 0;
+    g_sharedConfig->keyToggleProxy = s_keyToggleProxy;
+    g_sharedConfig->keyToggleMode = s_keyToggleMode;
+    g_sharedConfig->keyScaleUp = s_keyScaleUp;
+    g_sharedConfig->keyScaleDown = s_keyScaleDown;
+    g_sharedConfig->writerSource = source;
+    g_sharedConfig->version++;
+    s_lastCompanionVersion = g_sharedConfig->version;
+}
+
+static void PullFromSharedMemory() {
+    if (!g_sharedConfig || g_sharedConfig->magic != DLSSNR_MAGIC) return;
+    if (g_sharedConfig->version == s_lastCompanionVersion) return;
+    // If updated by Proxy hotkey (writerSource == 2), reflect in UI
+    if (g_sharedConfig->writerSource == 2) {
+        s_enableProxy = (g_sharedConfig->enableProxy != 0);
+        s_resolutionScale = g_sharedConfig->resolutionScale;
+        s_enlargementMode = g_sharedConfig->enlargementMode;
+        s_transferStrength = g_sharedConfig->transferStrength;
+        s_colorStrength = g_sharedConfig->colorStrength;
+        s_sharpness = g_sharedConfig->sharpness;
+        s_enableHotkeys = (g_sharedConfig->enableHotkeys != 0);
+        s_requireCtrlAlt = (g_sharedConfig->requireCtrlAlt != 0);
+        s_keyToggleProxy = g_sharedConfig->keyToggleProxy;
+        s_keyToggleMode = g_sharedConfig->keyToggleMode;
+        s_keyScaleUp = g_sharedConfig->keyScaleUp;
+        s_keyScaleDown = g_sharedConfig->keyScaleDown;
+        s_lastCompanionVersion = g_sharedConfig->version;
+    }
 }
 
 static void LoadIniSettings() {
@@ -186,6 +274,9 @@ static void SaveIniSettings() {
     swprintf_s(buf, L"%d", s_keyScaleDown);
     WritePrivateProfileStringW(L"Hotkeys", L"KeyScaleDown", buf, iniPath.c_str());
 
+    // Flush Windows profile cache to disk immediately
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, iniPath.c_str());
+
     WIN32_FILE_ATTRIBUTE_DATA fileInfo;
     if (GetFileAttributesExW(iniPath.c_str(), GetFileExInfoStandard, &fileInfo)) {
         s_lastDiskWriteTime = fileInfo.ftLastWriteTime;
@@ -193,11 +284,13 @@ static void SaveIniSettings() {
 }
 
 static void PollDiskChanges() {
+    PullFromSharedMemory();
+
     if (s_dirty) return;
 
     static ULONGLONG s_lastCheck = 0;
     ULONGLONG now = GetTickCount64();
-    if (now - s_lastCheck < 250) return;
+    if (now - s_lastCheck < 100) return;
     s_lastCheck = now;
 
     std::wstring iniPath = GetIniFilePath();
@@ -205,6 +298,7 @@ static void PollDiskChanges() {
     if (GetFileAttributesExW(iniPath.c_str(), GetFileExInfoStandard, &fileInfo)) {
         if (CompareFileTime(&fileInfo.ftLastWriteTime, &s_lastDiskWriteTime) != 0) {
             LoadIniSettings();
+            PushToSharedMemory(3); // Reflect disk update into shared memory
         }
     }
 }
@@ -220,6 +314,7 @@ static void DrawKeySelector(const char* label, int* currentVk) {
                 *currentVk = kAvailableKeys[i].vk;
                 s_dirty = true;
                 s_lastChangeTick = 0;
+                PushToSharedMemory(1);
             }
             if (isSelected) {
                 ImGui::SetItemDefaultFocus();
@@ -248,6 +343,7 @@ static void DrawOverlay(reshade::api::effect_runtime* /*runtime*/) {
     if (ImGui::Checkbox("Enable Proxy", &s_enableProxy)) {
         s_dirty = true;
         s_lastChangeTick = 0;
+        PushToSharedMemory(1);
     }
 
     if (!s_enableProxy) {
@@ -256,10 +352,12 @@ static void DrawOverlay(reshade::api::effect_runtime* /*runtime*/) {
         if (ImGui::SliderFloat("Resolution Scale", &s_resolutionScale, 0.25f, 1.00f, "%.2f")) {
             s_dirty = true;
             s_lastChangeTick = GetTickCount64();
+            PushToSharedMemory(1);
         }
         if (ImGui::IsItemDeactivatedAfterEdit()) {
             s_dirty = true;
             s_lastChangeTick = 0;
+            PushToSharedMemory(1);
         }
 
         if (s_resolutionScale < 0.999f) {
@@ -274,56 +372,66 @@ static void DrawOverlay(reshade::api::effect_runtime* /*runtime*/) {
             s_resolutionScale = 0.75f;
             s_dirty = true;
             s_lastChangeTick = 0;
+            PushToSharedMemory(1);
         }
         ImGui::SameLine();
         if (ImGui::SmallButton("85% (1440p)")) {
             s_resolutionScale = 0.85f;
             s_dirty = true;
             s_lastChangeTick = 0;
+            PushToSharedMemory(1);
         }
         ImGui::SameLine();
         if (ImGui::SmallButton("100% (Native)")) {
             s_resolutionScale = 1.00f;
             s_dirty = true;
             s_lastChangeTick = 0;
+            PushToSharedMemory(1);
         }
 
         const char* modeItems[] = {
-            "Direct Neural + RCAS (0) - Clean Denoised (Recommended)",
-            "Luminance Hybrid (1) - Blends Native with Neural Light"
+            "Direct Neural Upscale (0) - Full Neural Magnify",
+            "Matched Residual (1) - 1:1 Native Resolution Anchor (Recommended)"
         };
         int currentModeIdx = (s_enlargementMode == 1) ? 1 : 0;
         if (ImGui::Combo("Resolve Mode", &currentModeIdx, modeItems, 2)) {
             s_enlargementMode = (currentModeIdx == 1) ? 1 : 0;
             s_dirty = true;
             s_lastChangeTick = 0;
+            PushToSharedMemory(1);
         }
 
         if (ImGui::SliderFloat("RCAS Sharpness", &s_sharpness, 0.00f, 1.00f, "%.2f")) {
             s_dirty = true;
             s_lastChangeTick = GetTickCount64();
+            PushToSharedMemory(1);
         }
         if (ImGui::IsItemDeactivatedAfterEdit()) {
             s_dirty = true;
             s_lastChangeTick = 0;
+            PushToSharedMemory(1);
         }
 
         if (ImGui::SliderFloat("Transfer Strength", &s_transferStrength, 0.00f, 2.00f, "%.2f")) {
             s_dirty = true;
             s_lastChangeTick = GetTickCount64();
+            PushToSharedMemory(1);
         }
         if (ImGui::IsItemDeactivatedAfterEdit()) {
             s_dirty = true;
             s_lastChangeTick = 0;
+            PushToSharedMemory(1);
         }
 
         if (ImGui::SliderFloat("Color Strength", &s_colorStrength, 0.00f, 1.00f, "%.2f")) {
             s_dirty = true;
             s_lastChangeTick = GetTickCount64();
+            PushToSharedMemory(1);
         }
         if (ImGui::IsItemDeactivatedAfterEdit()) {
             s_dirty = true;
             s_lastChangeTick = 0;
+            PushToSharedMemory(1);
         }
     }
 
@@ -333,12 +441,14 @@ static void DrawOverlay(reshade::api::effect_runtime* /*runtime*/) {
         if (ImGui::Checkbox("Enable In-Game Hotkeys", &s_enableHotkeys)) {
             s_dirty = true;
             s_lastChangeTick = 0;
+            PushToSharedMemory(1);
         }
 
         if (s_enableHotkeys) {
             if (ImGui::Checkbox("Require Ctrl + Alt Modifiers", &s_requireCtrlAlt)) {
                 s_dirty = true;
                 s_lastChangeTick = 0;
+                PushToSharedMemory(1);
             }
 
             DrawKeySelector("Toggle Proxy Key", &s_keyToggleProxy);
@@ -367,7 +477,7 @@ static void DrawOverlay(reshade::api::effect_runtime* /*runtime*/) {
             snprintf(s_statusMsg, sizeof(s_statusMsg), "Saved to nvngx_dlssnr.ini (Scale=%.2f, Sharp=%.2f)", s_resolutionScale, s_sharpness);
             s_statusMsgTick = now;
         } else {
-            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "%s", "Applying changes...");
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "%s", "Live updating (syncing to INI)...");
         }
     }
 
@@ -388,10 +498,12 @@ BOOL WINAPI DllMain(HMODULE hModule, DWORD fdwReason, LPVOID) {
         if (!reshade::register_addon(hModule))
             return FALSE;
         LoadIniSettings();
+        InitSharedMemory();
         reshade::register_overlay("DLSS-NR Cost Scaler", DrawOverlay);
         break;
     case DLL_PROCESS_DETACH:
         reshade::unregister_overlay("DLSS-NR Cost Scaler", DrawOverlay);
+        ShutdownSharedMemory();
         reshade::unregister_addon(hModule);
         break;
     }
