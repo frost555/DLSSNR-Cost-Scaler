@@ -82,6 +82,7 @@ static int   s_keyScaleDown     = VK_NEXT;
 
 // Debounce & Notification State
 static bool      s_dirty          = false;
+static bool      s_scaleDragging  = false;
 static ULONGLONG s_lastChangeTick = 0;
 static constexpr ULONGLONG DEBOUNCE_DELAY_MS = 250;
 static char      s_statusMsg[128] = "Synced with nvngx_dlssnr.ini";
@@ -165,8 +166,8 @@ static void PushToSharedMemory(uint32_t source) {
 static void PullFromSharedMemory() {
     if (!g_sharedConfig || g_sharedConfig->magic != DLSSNR_MAGIC) return;
     if (g_sharedConfig->version == s_lastCompanionVersion) return;
-    // If updated by Proxy hotkey (writerSource == 2), reflect in UI
-    if (g_sharedConfig->writerSource == 2) {
+    // If updated by Proxy hotkey or disk INI reload (writerSource != 1), reflect in UI
+    if (g_sharedConfig->writerSource != 1) {
         s_enableProxy = (g_sharedConfig->enableProxy != 0);
         s_resolutionScale = g_sharedConfig->resolutionScale;
         s_enlargementMode = g_sharedConfig->enlargementMode;
@@ -180,6 +181,12 @@ static void PullFromSharedMemory() {
         s_keyScaleUp = g_sharedConfig->keyScaleUp;
         s_keyScaleDown = g_sharedConfig->keyScaleDown;
         s_lastCompanionVersion = g_sharedConfig->version;
+
+        std::wstring iniPath = GetIniFilePath();
+        WIN32_FILE_ATTRIBUTE_DATA fileInfo;
+        if (GetFileAttributesExW(iniPath.c_str(), GetFileExInfoStandard, &fileInfo)) {
+            s_lastDiskWriteTime = fileInfo.ftLastWriteTime;
+        }
     }
 }
 
@@ -350,10 +357,10 @@ static void DrawOverlay(reshade::api::effect_runtime* /*runtime*/) {
         ImGui::TextDisabled("%s", "Proxy is disabled. DLSS-NR runs at native resolution with zero scaling.");
     } else {
         if (ImGui::SliderFloat("Resolution Scale", &s_resolutionScale, 0.25f, 1.00f, "%.2f")) {
-            s_dirty = true;
-            s_lastChangeTick = GetTickCount64();
+            s_scaleDragging = true;
         }
         if (ImGui::IsItemDeactivatedAfterEdit()) {
+            s_scaleDragging = false;
             s_dirty = true;
             s_lastChangeTick = 0;
             PushToSharedMemory(1);
@@ -369,6 +376,7 @@ static void DrawOverlay(reshade::api::effect_runtime* /*runtime*/) {
         ImGui::SameLine();
         if (ImGui::SmallButton("75% (Sweet Spot)")) {
             s_resolutionScale = 0.75f;
+            s_scaleDragging = false;
             s_dirty = true;
             s_lastChangeTick = 0;
             PushToSharedMemory(1);
@@ -376,6 +384,7 @@ static void DrawOverlay(reshade::api::effect_runtime* /*runtime*/) {
         ImGui::SameLine();
         if (ImGui::SmallButton("85% (1440p)")) {
             s_resolutionScale = 0.85f;
+            s_scaleDragging = false;
             s_dirty = true;
             s_lastChangeTick = 0;
             PushToSharedMemory(1);
@@ -383,6 +392,7 @@ static void DrawOverlay(reshade::api::effect_runtime* /*runtime*/) {
         ImGui::SameLine();
         if (ImGui::SmallButton("100% (Native)")) {
             s_resolutionScale = 1.00f;
+            s_scaleDragging = false;
             s_dirty = true;
             s_lastChangeTick = 0;
             PushToSharedMemory(1);
@@ -469,15 +479,15 @@ static void DrawOverlay(reshade::api::effect_runtime* /*runtime*/) {
     ImGui::Separator();
 
     ULONGLONG now = GetTickCount64();
-    if (s_dirty) {
-        if (s_lastChangeTick == 0 || (now - s_lastChangeTick >= 350)) {
+    if (s_scaleDragging) {
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "%s", "Release slider to apply resolution...");
+    } else if (s_dirty) {
+        if (s_lastChangeTick == 0 || (now - s_lastChangeTick >= DEBOUNCE_DELAY_MS)) {
             PushToSharedMemory(1);
             SaveIniSettings();
             s_dirty = false;
             snprintf(s_statusMsg, sizeof(s_statusMsg), "Saved to nvngx_dlssnr.ini (Scale=%.2f, Sharp=%.2f)", s_resolutionScale, s_sharpness);
             s_statusMsgTick = now;
-        } else {
-            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "%s", "Release slider to apply resolution...");
         }
     }
 

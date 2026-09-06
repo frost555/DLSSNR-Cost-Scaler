@@ -96,6 +96,8 @@ static void SaveConfigValue(const wchar_t* key, const wchar_t* value) {
     }
 }
 
+static void PushProxyToSharedMemory();
+
 static void LoadConfig() {
     if (g_iniPath[0] == L'\0') {
         wchar_t exePath[MAX_PATH] = { 0 };
@@ -159,6 +161,8 @@ static void LoadConfig() {
 
     Log("[Proxy] Config loaded: EnableProxy = %d, ResolutionScale = %.2f, EnlargementMode = %u, TransferStrength = %.2f, Sharpness = %.2f, ColorStrength = %.2f, EnableHotkeys = %d",
         g_enableProxy.load() ? 1 : 0, val, g_enlargementMode.load(), g_transferStrength.load(), g_sharpness.load(), g_colorStrength.load(), g_enableHotkeys ? 1 : 0);
+
+    PushProxyToSharedMemory();
 }
 
 static void PushProxyToSharedMemory() {
@@ -459,10 +463,12 @@ static FeatureSlot g_slots[MAX_FEATURE_SLOTS] = {};
 
 static std::recursive_mutex g_proxyMutex;
 
+static constexpr int RETIRE_FRAME_DELAY = 64;
+
 struct NrRetired {
     void* feature = nullptr;
     ID3D12Resource* resource = nullptr;
-    int framesLeft = 4;
+    int framesLeft = RETIRE_FRAME_DELAY;
 };
 static std::vector<NrRetired> g_retiredList;
 
@@ -470,18 +476,18 @@ static void ParkNrFeature(void*& feature) {
     if (!feature) return;
     NrRetired r;
     r.feature = feature;
-    r.framesLeft = 4;
+    r.framesLeft = RETIRE_FRAME_DELAY;
     feature = nullptr;
     g_retiredList.push_back(r);
 }
 
 static void ReleaseSlotScratch(FeatureSlot& slot) {
     if (slot.colorSmall) {
-        NrRetired r; r.resource = slot.colorSmall; r.framesLeft = 4; g_retiredList.push_back(r);
+        NrRetired r; r.resource = slot.colorSmall; r.framesLeft = RETIRE_FRAME_DELAY; g_retiredList.push_back(r);
         slot.colorSmall = nullptr;
     }
     if (slot.outputSmall) {
-        NrRetired r; r.resource = slot.outputSmall; r.framesLeft = 4; g_retiredList.push_back(r);
+        NrRetired r; r.resource = slot.outputSmall; r.framesLeft = RETIRE_FRAME_DELAY; g_retiredList.push_back(r);
         slot.outputSmall = nullptr;
     }
     slot.colorSmallState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -494,7 +500,7 @@ static void ReleaseSlotResources(FeatureSlot& slot) {
     }
     ReleaseSlotScratch(slot);
     if (slot.nativeScratch) {
-        NrRetired r; r.resource = slot.nativeScratch; r.framesLeft = 4; g_retiredList.push_back(r);
+        NrRetired r; r.resource = slot.nativeScratch; r.framesLeft = RETIRE_FRAME_DELAY; g_retiredList.push_back(r);
         slot.nativeScratch = nullptr;
     }
     slot.nativeScratchState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -516,23 +522,6 @@ static void TickRetired() {
             g_retiredList[i].resource->Release();
         }
         g_retiredList.erase(g_retiredList.begin() + i);
-    }
-
-    // Safety cap: If retired list exceeds 8 items, force release items with framesLeft <= 2
-    if (g_retiredList.size() > 8) {
-        for (size_t i = 0; i < g_retiredList.size();) {
-            if (g_retiredList[i].framesLeft <= 2) {
-                if (g_retiredList[i].feature && real_Release) {
-                    real_Release(g_retiredList[i].feature);
-                }
-                if (g_retiredList[i].resource) {
-                    g_retiredList[i].resource->Release();
-                }
-                g_retiredList.erase(g_retiredList.begin() + i);
-            } else {
-                ++i;
-            }
-        }
     }
 }
 
@@ -871,12 +860,6 @@ static int EvaluateFeatureInternal(
 
     // Pass through directly to real DLL when proxy is disabled OR scale is 100% native
     if (!g_enableProxy.load() || currentScale >= 0.999f) {
-        for (size_t i = 0; i < MAX_FEATURE_SLOTS; ++i) {
-            if (g_slots[i].inUse && (g_slots[i].colorSmall || g_slots[i].activeFeature)) {
-                ReleaseSlotResources(g_slots[i]);
-                g_slots[i].scale = 1.0f;
-            }
-        }
         if (params && nativeW > 0 && nativeH > 0) {
             params->Set("DLSSNR.Color", origColor);
             params->Set("DLSSNR.Output", origOutput);
@@ -1035,7 +1018,7 @@ static int EvaluateFeatureInternal(
                 ReleaseSlotScratch(*slot);
                 if (!slot->nativeScratch || slot->nativeW != nativeW || slot->nativeH != nativeH) {
                     if (slot->nativeScratch) {
-                        NrRetired r; r.resource = slot->nativeScratch; r.framesLeft = 4; g_retiredList.push_back(r);
+                        NrRetired r; r.resource = slot->nativeScratch; r.framesLeft = RETIRE_FRAME_DELAY; g_retiredList.push_back(r);
                         slot->nativeScratch = nullptr;
                     }
                     slot->nativeScratch = CreateScratchTexture(device, scratchFormat, nativeW, nativeH);
