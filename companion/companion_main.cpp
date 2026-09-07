@@ -1,4 +1,4 @@
-#define WIN32_LEAN_AND_MEAN
+﻿#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shellapi.h>
 #include <cstdio>
@@ -72,7 +72,7 @@ static int FindKeyIndex(int vk) {
 // Runtime Configuration State
 static bool  s_enableProxy      = true;
 static float s_resolutionScale  = 0.75f;
-static int   s_enlargementMode  = 1; // 1 = Matched Residual, 0 = Bilinear
+static int   s_enlargementMode  = 1; // 0 = Direct Upscale, 1 = Matched Residual, 2 = Matched Residue Original
 static float s_transferStrength = 1.00f;
 static float s_colorStrength    = 1.00f;
 static float s_sharpness        = 0.20f;
@@ -211,7 +211,7 @@ static void LoadIniSettings() {
     s_resolutionScale = val;
 
     s_enlargementMode = GetPrivateProfileIntW(L"DLSSNR_Proxy", L"EnlargementMode", 1, iniPath.c_str());
-    if (s_enlargementMode != 0 && s_enlargementMode != 1) s_enlargementMode = 1;
+    if (s_enlargementMode < 0 || s_enlargementMode > 2) s_enlargementMode = 1;
 
     wchar_t transferBuf[64] = { 0 };
     GetPrivateProfileStringW(L"DLSSNR_Proxy", L"TransferStrength", L"1.00", transferBuf, 64, iniPath.c_str());
@@ -373,6 +373,7 @@ static void CopyDebugInfoToClipboard() {
         g_sharedConfig->resolutionScale,
         g_sharedConfig->debugWorkW, g_sharedConfig->debugWorkH,
         g_sharedConfig->debugNativeW, g_sharedConfig->debugNativeH,
+        (g_sharedConfig->enlargementMode == 2) ? "Matched Residue Original" :
         (g_sharedConfig->enlargementMode == 1) ? "Matched Residual" : "Direct Upscale",
         g_sharedConfig->transferStrength,
         g_sharedConfig->colorStrength,
@@ -469,11 +470,12 @@ static void DrawOverlay(reshade::api::effect_runtime* /*runtime*/) {
 
         const char* modeItems[] = {
             "Direct Neural Upscale (0) - Full Neural Magnify",
-            "Matched Residual (1) - 1:1 Native Resolution Anchor (Recommended)"
+            "Matched Residual (1) - 1:1 Native Resolution Anchor (Recommended)",
+            "Matched Residue Original (2)"
         };
-        int currentModeIdx = (s_enlargementMode == 1) ? 1 : 0;
-        if (ImGui::Combo("Resolve Mode", &currentModeIdx, modeItems, 2)) {
-            s_enlargementMode = (currentModeIdx == 1) ? 1 : 0;
+        int currentModeIdx = (s_enlargementMode >= 0 && s_enlargementMode <= 2) ? s_enlargementMode : 1;
+        if (ImGui::Combo("Resolve Mode", &currentModeIdx, modeItems, 3)) {
+            s_enlargementMode = currentModeIdx;
             s_dirty = true;
             s_lastChangeTick = 0;
             PushToSharedMemory(1);
