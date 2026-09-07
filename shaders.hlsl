@@ -139,21 +139,7 @@ void CS_Resolve(uint3 id : SV_DispatchThreadID)
     float3 smallInput = gSmallInput.SampleLevel(gLinear, uv, 0).rgb;
     float3 smallOutput = gSmallOutput.SampleLevel(gLinear, uv, 0).rgb;
 
-    // 3. Compute neural delta / edit
-    float3 edit = smallOutput - smallInput;
-
-    // Chroma vs Luma control for ColorStrength
-    float editLuma = dot(edit, kLuma);
-    float3 editChroma = edit - editLuma;
-    float3 controlledEdit = editLuma + editChroma * saturate(gColorStrength);
-
-    // Apply TransferStrength
-    float3 scaledEdit = controlledEdit * gTransferStrength;
-
-    // Base native frame + scaled neural delta
-    float3 result = max(original + scaledEdit, 0.0);
-
-    // 4. HDR highlight & shadow guard using luminance ratio
+    // Luminance values
     float origLuma = dot(max(original, 0.0), kLuma);
     float inLuma   = dot(max(smallInput, 0.0), kLuma);
     float outLuma  = dot(max(smallOutput, 0.0), kLuma);
@@ -161,6 +147,14 @@ void CS_Resolve(uint3 id : SV_DispatchThreadID)
     const float kFloor = 1.0 / 512.0;
     float lumaRatio = (outLuma + kFloor) / (inLuma + kFloor);
 
+    // 3. Resolve calculation branch
+    float brightnessScale = pow(lumaRatio, gTransferStrength);
+
+    float3 lumaScaledResult  = max((original + kFloor) * brightnessScale - kFloor, 0.0);
+    float3 colorDeltaResult  = max(original + (smallOutput - smallInput) * gTransferStrength, 0.0);
+    float3 result = lerp(lumaScaledResult, colorDeltaResult, saturate(gColorStrength));
+
+    // 4. HDR highlight & shadow guard using luminance ratio
     float resLuma = dot(result, kLuma);
     if (resLuma > 1e-5 && inLuma > 1e-5)
     {
