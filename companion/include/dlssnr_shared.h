@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <cstdint>
@@ -23,5 +23,19 @@ struct DlssnrSharedConfig {
     uint32_t keyScaleUp;
     uint32_t keyScaleDown;
     uint32_t writerSource;     // 1 = Companion UI, 2 = Proxy/Hotkey, 3 = Disk INI
+
+    // Telemetry & Diagnostics
+    uint32_t debugNativeW;
+    uint32_t debugNativeH;
+    uint32_t debugWorkW;
+    uint32_t debugWorkH;
+    uint32_t debugFormat;
+    uint32_t debugHasDepth;
+    uint32_t debugDepthW;
+    uint32_t debugDepthH;
+    uint32_t debugHasMVec;
+    uint32_t debugMvW;
+    uint32_t debugMvH;
+    uint32_t debugActiveSlot;
 };
 #pragma pack(pop)

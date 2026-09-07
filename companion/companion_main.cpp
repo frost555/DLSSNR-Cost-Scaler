@@ -1,10 +1,13 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <shellapi.h>
 #include <cstdio>
 #include <cwchar>
 #include <string>
 #include <vector>
 #include <algorithm>
+
+#pragma comment(lib, "shell32.lib")
 
 #define ImTextureID ImU64
 #include "imgui.h"
@@ -331,6 +334,72 @@ static void DrawKeySelector(const char* label, int* currentVk) {
     }
 }
 
+static const char* GetDxgiFormatString(uint32_t format) {
+    switch (format) {
+    case 10: return "R16G16B16A16_FLOAT (10)";
+    case 24: return "R10G10B10A2_UNORM (24)";
+    case 26: return "R11G11B10_FLOAT (26)";
+    case 28: return "R8G8B8A8_UNORM (28)";
+    case 29: return "R8G8B8A8_UNORM_SRGB (29)";
+    case 87: return "B8G8R8A8_UNORM (87)";
+    case 91: return "B8G8R8A8_UNORM_SRGB (91)";
+    default: {
+        static char buf[32];
+        snprintf(buf, sizeof(buf), "DXGI_FORMAT_%u", format);
+        return buf;
+    }
+    }
+}
+
+static void CopyDebugInfoToClipboard() {
+    if (!g_sharedConfig || g_sharedConfig->magic != DLSSNR_MAGIC) return;
+    char text[1024];
+    snprintf(text, sizeof(text),
+        "=== DLSS-NR Cost Scaler Diagnostics ===\r\n"
+        "Proxy Status: %s\r\n"
+        "Resolution Scale: %.2f (Work: %ux%u -> Native: %ux%u)\r\n"
+        "Resolve Mode: %s\r\n"
+        "Transfer Strength: %.2f\r\n"
+        "Color Strength: %.2f\r\n"
+        "Sharpness: %.2f\r\n"
+        "DXGI Format: %s\r\n"
+        "G-Buffers:\r\n"
+        "  - Depth: %s (%ux%u)\r\n"
+        "  - Motion Vectors: %s (%ux%u)\r\n"
+        "Active Slot: Pass %u\r\n"
+        "Shared Mem Version: %u (Source: %u)\r\n"
+        "========================================",
+        (g_sharedConfig->enableProxy != 0) ? "Active" : "Bypassed",
+        g_sharedConfig->resolutionScale,
+        g_sharedConfig->debugWorkW, g_sharedConfig->debugWorkH,
+        g_sharedConfig->debugNativeW, g_sharedConfig->debugNativeH,
+        (g_sharedConfig->enlargementMode == 1) ? "Matched Residual" : "Direct Upscale",
+        g_sharedConfig->transferStrength,
+        g_sharedConfig->colorStrength,
+        g_sharedConfig->sharpness,
+        GetDxgiFormatString(g_sharedConfig->debugFormat),
+        g_sharedConfig->debugHasDepth ? "Present" : "None",
+        g_sharedConfig->debugDepthW, g_sharedConfig->debugDepthH,
+        g_sharedConfig->debugHasMVec ? "Present" : "None",
+        g_sharedConfig->debugMvW, g_sharedConfig->debugMvH,
+        g_sharedConfig->debugActiveSlot,
+        g_sharedConfig->version,
+        g_sharedConfig->writerSource
+    );
+
+    if (OpenClipboard(nullptr)) {
+        EmptyClipboard();
+        size_t len = strlen(text) + 1;
+        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, len);
+        if (hMem) {
+            memcpy(GlobalLock(hMem), text, len);
+            GlobalUnlock(hMem);
+            SetClipboardData(CF_TEXT, hMem);
+        }
+        CloseClipboard();
+    }
+}
+
 static void DrawOverlay(reshade::api::effect_runtime* /*runtime*/) {
     PollDiskChanges();
 
@@ -497,6 +566,88 @@ static void DrawOverlay(reshade::api::effect_runtime* /*runtime*/) {
         } else {
             ImGui::TextDisabled("%s", "All settings saved and active in nvngx_dlssnr.ini");
         }
+    }
+
+    ImGui::Separator();
+
+    if (ImGui::CollapsingHeader("Debug & Diagnostics")) {
+        if (g_sharedConfig && g_sharedConfig->magic == DLSSNR_MAGIC && g_sharedConfig->debugNativeW > 0) {
+            ImGui::Text("Native Resolution:  %ux%u", g_sharedConfig->debugNativeW, g_sharedConfig->debugNativeH);
+            ImGui::Text("Working Resolution: %ux%u (%.2fx)", g_sharedConfig->debugWorkW, g_sharedConfig->debugWorkH, g_sharedConfig->resolutionScale);
+            ImGui::Text("Color Format:       %s", GetDxgiFormatString(g_sharedConfig->debugFormat));
+            ImGui::Text("Active Slot:        Pass %u", g_sharedConfig->debugActiveSlot);
+
+            if (g_sharedConfig->debugHasDepth) {
+                ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.5f, 1.0f), "Depth Buffer:       Found (%ux%u)", g_sharedConfig->debugDepthW, g_sharedConfig->debugDepthH);
+            } else {
+                ImGui::TextDisabled("Depth Buffer:       None");
+            }
+
+            if (g_sharedConfig->debugHasMVec) {
+                ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.5f, 1.0f), "Motion Vectors:     Found (%ux%u)", g_sharedConfig->debugMvW, g_sharedConfig->debugMvH);
+            } else {
+                ImGui::TextDisabled("Motion Vectors:     None");
+            }
+
+            ImGui::Spacing();
+            static ULONGLONG s_copiedTick = 0;
+            if (ImGui::Button("Copy Debug Info to Clipboard")) {
+                CopyDebugInfoToClipboard();
+                s_copiedTick = GetTickCount64();
+            }
+            if (GetTickCount64() - s_copiedTick < 3000) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", "Copied!");
+            }
+        } else {
+            ImGui::TextDisabled("%s", "No active frame telemetry received yet from proxy.");
+            ImGui::TextDisabled("%s", "(Launch game with proxy DLL and enter 3D scene)");
+        }
+    }
+
+    ImGui::Separator();
+
+    if (ImGui::CollapsingHeader("Links & Credits")) {
+        ImGui::TextColored(ImVec4(0.35f, 0.75f, 1.00f, 1.00f), "%s", "DLSS-NR Cost Scaler");
+        ImGui::Text("Created & Maintained by Xen");
+        ImGui::Spacing();
+
+        ImGui::BulletText("GitHub:");
+        ImGui::SameLine();
+        if (ImGui::Selectable("https://github.com/xenmods/DLSSNR-Cost-Scaler")) {
+            ShellExecuteW(nullptr, L"open", L"https://github.com/xenmods/DLSSNR-Cost-Scaler", nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Click to open repository in default browser");
+        }
+
+        ImGui::BulletText("Discord:");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.45f, 0.55f, 1.00f, 1.00f), "%s", "xenmods");
+        ImGui::SameLine();
+        static ULONGLONG s_discordCopiedTick = 0;
+        if (ImGui::SmallButton("Copy Handle")) {
+            if (OpenClipboard(nullptr)) {
+                EmptyClipboard();
+                const char* handle = "xenmods";
+                size_t len = strlen(handle) + 1;
+                HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, len);
+                if (hMem) {
+                    memcpy(GlobalLock(hMem), handle, len);
+                    GlobalUnlock(hMem);
+                    SetClipboardData(CF_TEXT, hMem);
+                }
+                CloseClipboard();
+                s_discordCopiedTick = GetTickCount64();
+            }
+        }
+        if (GetTickCount64() - s_discordCopiedTick < 3000) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", "Copied!");
+        }
+
+        ImGui::Spacing();
+        ImGui::TextDisabled("%s", "Special thanks to RenoDX community, Shortfuse, and contributors.");
     }
 
     ImGui::PopStyleVar(2);

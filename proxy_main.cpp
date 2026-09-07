@@ -856,41 +856,24 @@ static int EvaluateFeatureInternal(
 
     uint32_t nativeW = (uint32_t)colorDesc.Width;
     uint32_t nativeH = colorDesc.Height;
+    DXGI_FORMAT typedColorFormat = ToNonTypeless(colorDesc.Format);
     float currentScale = g_scale.load();
 
     // Pass through directly to real DLL when proxy is disabled OR scale is 100% native
     if (!g_enableProxy.load() || currentScale >= 0.999f) {
-        if (params && nativeW > 0 && nativeH > 0) {
-            params->Set("DLSSNR.Color", origColor);
-            params->Set("DLSSNR.Output", origOutput);
-            params->Set("Color", origColor);
-            params->Set("Output", origOutput);
-
-            params->Set("DLSSNR.Width", nativeW);
-            params->Set("DLSSNR.Height", nativeH);
-            params->Set("Width", nativeW);
-            params->Set("Height", nativeH);
-
-            params->Set("InputWidth", nativeW);
-            params->Set("InputHeight", nativeH);
-            params->Set("OutWidth", nativeW);
-            params->Set("OutHeight", nativeH);
-            params->Set("DLSSNR.InputWidth", nativeW);
-            params->Set("DLSSNR.InputHeight", nativeH);
-            params->Set("DLSSNR.OutputWidth", nativeW);
-            params->Set("DLSSNR.OutputHeight", nativeH);
-
-            params->Set("DLSSNR.ColorSubrectBaseX", 0u);
-            params->Set("DLSSNR.ColorSubrectBaseY", 0u);
-            params->Set("DLSSNR.ColorSubrectWidth", nativeW);
-            params->Set("DLSSNR.ColorSubrectHeight", nativeH);
-
-            params->Set("DLSSNR.OutputSubrectBaseX", 0u);
-            params->Set("DLSSNR.OutputSubrectBaseY", 0u);
-            params->Set("DLSSNR.OutputSubrectWidth", nativeW);
-            params->Set("DLSSNR.OutputSubrectHeight", nativeH);
-
-            params->Set("DepthHighRes", 0u);
+        if (g_proxySharedConfig && g_proxySharedConfig->magic == DLSSNR_MAGIC) {
+            g_proxySharedConfig->debugNativeW = nativeW;
+            g_proxySharedConfig->debugNativeH = nativeH;
+            g_proxySharedConfig->debugWorkW = nativeW;
+            g_proxySharedConfig->debugWorkH = nativeH;
+            g_proxySharedConfig->debugFormat = (uint32_t)typedColorFormat;
+            g_proxySharedConfig->debugHasDepth = 0;
+            g_proxySharedConfig->debugDepthW = 0;
+            g_proxySharedConfig->debugDepthH = 0;
+            g_proxySharedConfig->debugHasMVec = 0;
+            g_proxySharedConfig->debugMvW = 0;
+            g_proxySharedConfig->debugMvH = 0;
+            g_proxySharedConfig->debugActiveSlot = 0;
         }
         return real_Evaluate(InCmdList, InFeatureHandle, InParameters, InCallback);
     }
@@ -928,7 +911,6 @@ static int EvaluateFeatureInternal(
     if (workW < 64) workW = 64;
     if (workH < 64) workH = 64;
 
-    DXGI_FORMAT typedColorFormat = ToNonTypeless(colorDesc.Format);
     DXGI_FORMAT typedOutFormat = ToNonTypeless(outDesc.Format);
     DXGI_FORMAT scratchFormat = GetUavSafeScratchFormat(typedColorFormat);
 
@@ -1058,41 +1040,20 @@ static int EvaluateFeatureInternal(
             ParkNrFeature(slot->activeFeature);
         }
 
-        uint32_t origWidth = 0, origHeight = 0, origOutW = 0, origOutH = 0;
-        uint32_t origInW = 0, origInH = 0;
-        uint32_t origDlssInW = 0, origDlssInH = 0, origDlssOutW = 0, origDlssOutH = 0;
-        uint32_t origResW = 0, origResH = 0, origResOutW = 0, origResOutH = 0;
-        ID3D12Resource* origColorParam = nullptr;
-        ID3D12Resource* origOutParam = nullptr;
-        params->Get("Width", &origWidth);
-        params->Get("Height", &origHeight);
-        params->Get("OutWidth", &origOutW);
-        params->Get("OutHeight", &origOutH);
-        params->Get("InputWidth", &origInW);
-        params->Get("InputHeight", &origInH);
-        params->Get("DLSSNR.InputWidth", &origDlssInW);
-        params->Get("DLSSNR.InputHeight", &origDlssInH);
-        params->Get("DLSSNR.OutputWidth", &origDlssOutW);
-        params->Get("DLSSNR.OutputHeight", &origDlssOutH);
-        params->Get("ResourceWidth", &origResW);
-        params->Get("ResourceHeight", &origResH);
-        params->Get("ResourceOutWidth", &origResOutW);
-        params->Get("ResourceOutHeight", &origResOutH);
-        params->Get("Color", &origColorParam);
-        params->Get("Output", &origOutParam);
+        uint32_t origDlssW = nativeW, origDlssH = nativeH;
+        params->Get("DLSSNR.Width", &origDlssW);
+        params->Get("DLSSNR.Height", &origDlssH);
 
-        params->Set("Width", workW);
-        params->Set("Height", workH);
-        params->Set("OutWidth", workW);
-        params->Set("OutHeight", workH);
-        params->Set("InputWidth", workW);
-        params->Set("InputHeight", workH);
+        uint32_t origColorSubW = nativeW, origColorSubH = nativeH;
+        params->Get("DLSSNR.ColorSubrectWidth", &origColorSubW);
+        params->Get("DLSSNR.ColorSubrectHeight", &origColorSubH);
+
+        uint32_t origOutSubW = nativeW, origOutSubH = nativeH;
+        params->Get("DLSSNR.OutputSubrectWidth", &origOutSubW);
+        params->Get("DLSSNR.OutputSubrectHeight", &origOutSubH);
+
         params->Set("DLSSNR.Width", workW);
         params->Set("DLSSNR.Height", workH);
-        params->Set("DLSSNR.InputWidth", workW);
-        params->Set("DLSSNR.InputHeight", workH);
-        params->Set("DLSSNR.OutputWidth", workW);
-        params->Set("DLSSNR.OutputHeight", workH);
         params->Set("DLSSNR.ColorSubrectBaseX", 0u);
         params->Set("DLSSNR.ColorSubrectBaseY", 0u);
         params->Set("DLSSNR.ColorSubrectWidth", workW);
@@ -1102,38 +1063,37 @@ static int EvaluateFeatureInternal(
         params->Set("DLSSNR.OutputSubrectWidth", workW);
         params->Set("DLSSNR.OutputSubrectHeight", workH);
 
-        // Synchronize resource dimensions so _nvngx.dll does not assume native buffer stride (Issue #4)
-        if (origResW > 0) {
-            params->Set("ResourceWidth", workW);
-            params->Set("ResourceHeight", workH);
-            params->Set("ResourceOutWidth", workW);
-            params->Set("ResourceOutHeight", workH);
-        }
-
         // Guide buffer subrect synchronization during feature creation
         ID3D12Resource* depthResCreate = nullptr;
         if (params->Get("DLSSNR.Depth", &depthResCreate) != 0 || !depthResCreate) {
             params->Get("Depth", &depthResCreate);
         }
+        uint32_t origDepthSubW = 0, origDepthSubH = 0;
         if (depthResCreate) {
+            params->Get("DLSSNR.DepthSubrectWidth", &origDepthSubW);
+            params->Get("DLSSNR.DepthSubrectHeight", &origDepthSubH);
             D3D12_RESOURCE_DESC dDesc = depthResCreate->GetDesc();
-            uint32_t dW = (uint32_t)dDesc.Width;
-            uint32_t dH = dDesc.Height;
+            uint32_t dW = origDepthSubW ? origDepthSubW : (uint32_t)dDesc.Width;
+            uint32_t dH = origDepthSubH ? origDepthSubH : dDesc.Height;
             params->Set("DLSSNR.DepthSubrectBaseX", 0u);
             params->Set("DLSSNR.DepthSubrectBaseY", 0u);
             params->Set("DLSSNR.DepthSubrectWidth", dW);
             params->Set("DLSSNR.DepthSubrectHeight", dH);
-            params->Set("DepthHighRes", (dW > workW) ? 1 : 0);
         }
 
         ID3D12Resource* mvecResCreate = nullptr;
         if (params->Get("DLSSNR.MotionVectors", &mvecResCreate) != 0 || !mvecResCreate) {
-            params->Get("MotionVectors", &mvecResCreate);
+            if (params->Get("DLSSNR.MVec", &mvecResCreate) != 0 || !mvecResCreate) {
+                params->Get("MotionVectors", &mvecResCreate);
+            }
         }
+        uint32_t origMvSubW = 0, origMvSubH = 0;
         if (mvecResCreate) {
+            params->Get("DLSSNR.MVecSubrectWidth", &origMvSubW);
+            params->Get("DLSSNR.MVecSubrectHeight", &origMvSubH);
             D3D12_RESOURCE_DESC mDesc = mvecResCreate->GetDesc();
-            uint32_t mW = (uint32_t)mDesc.Width;
-            uint32_t mH = mDesc.Height;
+            uint32_t mW = origMvSubW ? origMvSubW : (uint32_t)mDesc.Width;
+            uint32_t mH = origMvSubH ? origMvSubH : mDesc.Height;
             params->Set("DLSSNR.MVecSubrectBaseX", 0u);
             params->Set("DLSSNR.MVecSubrectBaseY", 0u);
             params->Set("DLSSNR.MVecSubrectWidth", mW);
@@ -1141,13 +1101,9 @@ static int EvaluateFeatureInternal(
         }
 
         if (currentScale < 0.999f) {
-            params->Set("Color", slot->colorSmall);
-            params->Set("Output", slot->outputSmall);
             params->Set("DLSSNR.Color", slot->colorSmall);
             params->Set("DLSSNR.Output", slot->outputSmall);
         } else {
-            params->Set("Color", origColor);
-            params->Set("Output", origOutput);
             params->Set("DLSSNR.Color", origColor);
             params->Set("DLSSNR.Output", origOutput);
         }
@@ -1156,36 +1112,22 @@ static int EvaluateFeatureInternal(
         Log("[Proxy] Created neural feature in slot %u (%ux%u -> native %ux%u, scale=%.2f): res=0x%X, handle=%p",
             currentPass, workW, workH, nativeW, nativeH, currentScale, createRes, slot->activeFeature);
 
-        params->Set("Width", origWidth ? origWidth : nativeW);
-        params->Set("Height", origHeight ? origHeight : nativeH);
-        params->Set("OutWidth", origOutW ? origOutW : nativeW);
-        params->Set("OutHeight", origOutH ? origOutH : nativeH);
-        params->Set("InputWidth", origInW ? origInW : nativeW);
-        params->Set("InputHeight", origInH ? origInH : nativeH);
-        params->Set("DLSSNR.InputWidth", origDlssInW ? origDlssInW : nativeW);
-        params->Set("DLSSNR.InputHeight", origDlssInH ? origDlssInH : nativeH);
-        params->Set("DLSSNR.OutputWidth", origDlssOutW ? origDlssOutW : nativeW);
-        params->Set("DLSSNR.OutputHeight", origDlssOutH ? origDlssOutH : nativeH);
-        if (origResW) params->Set("ResourceWidth", origResW);
-        if (origResH) params->Set("ResourceHeight", origResH);
-        if (origResOutW) params->Set("ResourceOutWidth", origResOutW);
-        if (origResOutH) params->Set("ResourceOutHeight", origResOutH);
-        if (origColorParam) params->Set("Color", origColorParam);
-        if (origOutParam) params->Set("Output", origOutParam);
-
         params->Set("DLSSNR.Color", origColor);
         params->Set("DLSSNR.Output", origOutput);
-        params->Set("DLSSNR.Width", nativeW);
-        params->Set("DLSSNR.Height", nativeH);
-        params->Set("DLSSNR.ColorSubrectBaseX", 0u);
-        params->Set("DLSSNR.ColorSubrectBaseY", 0u);
-        params->Set("DLSSNR.ColorSubrectWidth", nativeW);
-        params->Set("DLSSNR.ColorSubrectHeight", nativeH);
-        params->Set("DLSSNR.OutputSubrectBaseX", 0u);
-        params->Set("DLSSNR.OutputSubrectBaseY", 0u);
-        params->Set("DLSSNR.OutputSubrectWidth", nativeW);
-        params->Set("DLSSNR.OutputSubrectHeight", nativeH);
-        params->Set("DepthHighRes", 0u);
+        params->Set("DLSSNR.Width", origDlssW ? origDlssW : nativeW);
+        params->Set("DLSSNR.Height", origDlssH ? origDlssH : nativeH);
+        params->Set("DLSSNR.ColorSubrectWidth", origColorSubW ? origColorSubW : nativeW);
+        params->Set("DLSSNR.ColorSubrectHeight", origColorSubH ? origColorSubH : nativeH);
+        params->Set("DLSSNR.OutputSubrectWidth", origOutSubW ? origOutSubW : nativeW);
+        params->Set("DLSSNR.OutputSubrectHeight", origOutSubH ? origOutSubH : nativeH);
+        if (depthResCreate && origDepthSubW > 0) {
+            params->Set("DLSSNR.DepthSubrectWidth", origDepthSubW);
+            params->Set("DLSSNR.DepthSubrectHeight", origDepthSubH);
+        }
+        if (mvecResCreate && origMvSubW > 0) {
+            params->Set("DLSSNR.MVecSubrectWidth", origMvSubW);
+            params->Set("DLSSNR.MVecSubrectHeight", origMvSubH);
+        }
 
         if (NVSDK_NGX_FAILED(createRes) || !slot->activeFeature) {
             static ULONGLONG s_lastCreateFailTick = 0;
@@ -1212,9 +1154,7 @@ static int EvaluateFeatureInternal(
 
     // Save original parameters
     float origMvX = 1.0f, origMvY = 1.0f;
-    uint32_t origW = nativeW, origH = nativeH;
-    uint32_t origInW = 0, origInH = 0, origOutW = 0, origOutH = 0;
-    uint32_t origDlssInW = 0, origDlssInH = 0, origDlssOutW = 0, origDlssOutH = 0;
+    uint32_t origDlssW = nativeW, origDlssH = nativeH;
 
     uint32_t origColorBaseX = 0, origColorBaseY = 0, origColorSubW = nativeW, origColorSubH = nativeH;
     uint32_t origOutBaseX = 0, origOutBaseY = 0, origOutSubW = nativeW, origOutSubH = nativeH;
@@ -1223,17 +1163,8 @@ static int EvaluateFeatureInternal(
 
     if (params->Get("DLSSNR.MVecScaleX", &origMvX) != 0) params->Get("MVecScaleX", &origMvX);
     if (params->Get("DLSSNR.MVecScaleY", &origMvY) != 0) params->Get("MVecScaleY", &origMvY);
-    if (params->Get("DLSSNR.Width", &origW) != 0) params->Get("Width", &origW);
-    if (params->Get("DLSSNR.Height", &origH) != 0) params->Get("Height", &origH);
-
-    params->Get("InputWidth", &origInW);
-    params->Get("InputHeight", &origInH);
-    params->Get("OutWidth", &origOutW);
-    params->Get("OutHeight", &origOutH);
-    params->Get("DLSSNR.InputWidth", &origDlssInW);
-    params->Get("DLSSNR.InputHeight", &origDlssInH);
-    params->Get("DLSSNR.OutputWidth", &origDlssOutW);
-    params->Get("DLSSNR.OutputHeight", &origDlssOutH);
+    params->Get("DLSSNR.Width", &origDlssW);
+    params->Get("DLSSNR.Height", &origDlssH);
 
     params->Get("DLSSNR.ColorSubrectBaseX", &origColorBaseX);
     params->Get("DLSSNR.ColorSubrectBaseY", &origColorBaseY);
@@ -1254,15 +1185,6 @@ static int EvaluateFeatureInternal(
     params->Get("DLSSNR.MVecSubrectBaseY", &origMvBaseY);
     params->Get("DLSSNR.MVecSubrectWidth", &origMvSubW);
     params->Get("DLSSNR.MVecSubrectHeight", &origMvSubH);
-
-    uint32_t origResW = 0, origResH = 0, origResOutW = 0, origResOutH = 0;
-    params->Get("ResourceWidth", &origResW);
-    params->Get("ResourceHeight", &origResH);
-    params->Get("ResourceOutWidth", &origResOutW);
-    params->Get("ResourceOutHeight", &origResOutH);
-
-    uint32_t origDepthHighRes = 0;
-    params->Get("DepthHighRes", &origDepthHighRes);
 
     // Query G-buffers if present (e.g. RenoDX Upscaled hook)
     ID3D12Resource* depthRes = nullptr;
@@ -1298,34 +1220,30 @@ static int EvaluateFeatureInternal(
             depthRes, actualDepthW, actualDepthH, mvecRes, actualMvW, actualMvH);
     }
 
+    // Update live telemetry for companion UI
+    if (g_proxySharedConfig && g_proxySharedConfig->magic == DLSSNR_MAGIC) {
+        g_proxySharedConfig->debugNativeW = nativeW;
+        g_proxySharedConfig->debugNativeH = nativeH;
+        g_proxySharedConfig->debugWorkW = workW;
+        g_proxySharedConfig->debugWorkH = workH;
+        g_proxySharedConfig->debugFormat = (uint32_t)typedColorFormat;
+        g_proxySharedConfig->debugHasDepth = depthRes ? 1 : 0;
+        g_proxySharedConfig->debugDepthW = depthRes ? actualDepthW : 0;
+        g_proxySharedConfig->debugDepthH = depthRes ? actualDepthH : 0;
+        g_proxySharedConfig->debugHasMVec = mvecRes ? 1 : 0;
+        g_proxySharedConfig->debugMvW = mvecRes ? actualMvW : 0;
+        g_proxySharedConfig->debugMvH = mvecRes ? actualMvH : 0;
+        g_proxySharedConfig->debugActiveSlot = currentPass;
+    }
+
     float mvFactor = (float)workW / (float)nativeW;
 
     auto RestoreParameters = [&]() {
         params->Set("DLSSNR.Color", origColor);
         params->Set("DLSSNR.Output", origOutput);
-        params->Set("Color", origColor);
-        params->Set("Output", origOutput);
 
-        params->Set("DLSSNR.Width", origW ? origW : nativeW);
-        params->Set("DLSSNR.Height", origH ? origH : nativeH);
-        params->Set("Width", origW ? origW : nativeW);
-        params->Set("Height", origH ? origH : nativeH);
-
-        params->Set("InputWidth", origInW ? origInW : nativeW);
-        params->Set("InputHeight", origInH ? origInH : nativeH);
-        params->Set("OutWidth", origOutW ? origOutW : nativeW);
-        params->Set("OutHeight", origOutH ? origOutH : nativeH);
-        params->Set("DLSSNR.InputWidth", origDlssInW ? origDlssInW : nativeW);
-        params->Set("DLSSNR.InputHeight", origDlssInH ? origDlssInH : nativeH);
-        params->Set("DLSSNR.OutputWidth", origDlssOutW ? origDlssOutW : nativeW);
-        params->Set("DLSSNR.OutputHeight", origDlssOutH ? origDlssOutH : nativeH);
-
-        if (origResW > 0) {
-            params->Set("ResourceWidth", origResW);
-            params->Set("ResourceHeight", origResH);
-            params->Set("ResourceOutWidth", origResOutW);
-            params->Set("ResourceOutHeight", origResOutH);
-        }
+        params->Set("DLSSNR.Width", origDlssW ? origDlssW : nativeW);
+        params->Set("DLSSNR.Height", origDlssH ? origDlssH : nativeH);
 
         params->Set("DLSSNR.ColorSubrectBaseX", origColorBaseX);
         params->Set("DLSSNR.ColorSubrectBaseY", origColorBaseY);
@@ -1340,22 +1258,19 @@ static int EvaluateFeatureInternal(
         if (depthRes) {
             params->Set("DLSSNR.DepthSubrectBaseX", origDepthBaseX);
             params->Set("DLSSNR.DepthSubrectBaseY", origDepthBaseY);
-            params->Set("DLSSNR.DepthSubrectWidth", actualDepthW);
-            params->Set("DLSSNR.DepthSubrectHeight", actualDepthH);
-            params->Set("DepthHighRes", origDepthHighRes);
+            params->Set("DLSSNR.DepthSubrectWidth", origDepthSubW ? origDepthSubW : actualDepthW);
+            params->Set("DLSSNR.DepthSubrectHeight", origDepthSubH ? origDepthSubH : actualDepthH);
         }
 
         if (mvecRes) {
             params->Set("DLSSNR.MVecSubrectBaseX", origMvBaseX);
             params->Set("DLSSNR.MVecSubrectBaseY", origMvBaseY);
-            params->Set("DLSSNR.MVecSubrectWidth", actualMvW);
-            params->Set("DLSSNR.MVecSubrectHeight", actualMvH);
+            params->Set("DLSSNR.MVecSubrectWidth", origMvSubW ? origMvSubW : actualMvW);
+            params->Set("DLSSNR.MVecSubrectHeight", origMvSubH ? origMvSubH : actualMvH);
         }
 
         params->Set("DLSSNR.MVecScaleX", origMvX);
         params->Set("DLSSNR.MVecScaleY", origMvY);
-        params->Set("MVecScaleX", origMvX);
-        params->Set("MVecScaleY", origMvY);
     };
 
     // Multi-pass transition barrier:
@@ -1412,29 +1327,9 @@ static int EvaluateFeatureInternal(
 
     params->Set("DLSSNR.Color", slot->colorSmall);
     params->Set("DLSSNR.Output", slot->outputSmall);
-    params->Set("Color", slot->colorSmall);
-    params->Set("Output", slot->outputSmall);
 
     params->Set("DLSSNR.Width", workW);
     params->Set("DLSSNR.Height", workH);
-    params->Set("Width", workW);
-    params->Set("Height", workH);
-    params->Set("InputWidth", workW);
-    params->Set("InputHeight", workH);
-    params->Set("OutWidth", workW);
-    params->Set("OutHeight", workH);
-    params->Set("DLSSNR.InputWidth", workW);
-    params->Set("DLSSNR.InputHeight", workH);
-    params->Set("DLSSNR.OutputWidth", workW);
-    params->Set("DLSSNR.OutputHeight", workH);
-
-    // Synchronize resource dimensions for evaluate (Issue #4) only if set by caller
-    if (origResW > 0) {
-        params->Set("ResourceWidth", workW);
-        params->Set("ResourceHeight", workH);
-        params->Set("ResourceOutWidth", workW);
-        params->Set("ResourceOutHeight", workH);
-    }
 
     params->Set("DLSSNR.ColorSubrectBaseX", 0u);
     params->Set("DLSSNR.ColorSubrectBaseY", 0u);
@@ -1451,7 +1346,6 @@ static int EvaluateFeatureInternal(
         params->Set("DLSSNR.DepthSubrectBaseY", origDepthBaseY);
         params->Set("DLSSNR.DepthSubrectWidth", actualDepthW);
         params->Set("DLSSNR.DepthSubrectHeight", actualDepthH);
-        params->Set("DepthHighRes", (actualDepthW > workW) ? 1 : 0);
     }
 
     if (mvecRes && actualMvW > 0 && actualMvH > 0) {
@@ -1463,8 +1357,6 @@ static int EvaluateFeatureInternal(
 
     params->Set("DLSSNR.MVecScaleX", origMvX * mvFactor);
     params->Set("DLSSNR.MVecScaleY", origMvY * mvFactor);
-    params->Set("MVecScaleX", origMvX * mvFactor);
-    params->Set("MVecScaleY", origMvY * mvFactor);
 
     int result = real_Evaluate(InCmdList, slot->activeFeature, InParameters, InCallback);
 
